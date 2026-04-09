@@ -1,0 +1,811 @@
+// FZ3A Phase 2b: Network image receive + DP display
+// Combines:
+//   - Phase 1 DP output (bare-metal, no GIC, poll driven DPDMA)
+//   - Phase 2a Ethernet + lwIP TCP echo (GIC + IRQ driven)
+// Flow:
+//   1. Init DP subsystem, link train, show initial "waiting" pattern
+//   2. Init GIC, lwIP, DHCP, TCP server on port 5000
+//   3. TCP recv callback parses [magic|w|h|fmt|pixels] and writes directly
+//      into the framebuffer at 0x10000000
+//   4. DPDMA auto-reads the updated framebuffer on next VSYNC
+// Status via UART1 -> CP2102 -> COM9
+#include <stdint.h>
+#include <string.h>
+#include "xparameters.h"
+#include "xdpdma.h"
+#include "xdppsu.h"
+#include "xavbuf.h"
+#include "xavbuf_clk.h"
+#include "xil_printf.h"
+#include "xil_cache.h"
+#include "sleep.h"
+#include "xscugic.h"
+#include "xil_exception.h"
+#include "xil_mmu.h"
+
+#include "lwip/err.h"
+#include "lwip/tcp.h"
+#include "lwip/inet.h"
+#include "lwip/init.h"
+#include "lwip/dhcp.h"
+#include "lwip/timeouts.h"
+#include "netif/xadapter.h"
+
+/* Display dimensions - referenced by the filter code below */
+#define FB_W   1280
+#define FB_H   720
+#define LINESIZE   (FB_W*4)
+#define STRIDE     LINESIZE
+#define BUFFERSIZE (FB_W*FB_H*4)
+
+/* ========== UART1 stdin/stdout override ========== */
+#define UART1_BASE   0xFF010000UL
+#define UART_SR      (*(volatile uint32_t*)(UART1_BASE + 0x2C))
+#define UART_FIFO    (*(volatile uint32_t*)(UART1_BASE + 0x30))
+#define UART_TXFULL  (1U << 4)
+#define UART_RXEMPTY (1U << 1)
+void outbyte(char c) { while (UART_SR & UART_TXFULL){} UART_FIFO = (uint32_t)(unsigned char)c; }
+/* Non-blocking read: returns -1 if no byte available. */
+static inline int uart_rx_poll(void) {
+    if (UART_SR & UART_RXEMPTY) return -1;
+    return (int)(UART_FIFO & 0xFFu);
+}
+
+/* ========== Image processing filters (ported from b3 v22v RTL) ========== */
+typedef enum {
+    FLT_NONE = 0,
+    FLT_INVERT,      /* color negative */
+    FLT_GRAY,        /* RGB -> luminance */
+    FLT_BINARIZE,    /* gray > 128 ? 255 : 0 */
+    FLT_HEATMAP,     /* threshold_region_segment: 16-color thermal LUT */
+    FLT_LOWLIGHT,    /* lowlight_enhance: gamma + weighted blend */
+    FLT_RED_ONLY,
+    FLT_GREEN_ONLY,
+    FLT_BLUE_ONLY,
+    FLT_BRIGHTER,    /* +64 clamp */
+    FLT_DARKER,      /* -64 clamp */
+    FLT_CHAN_SWAP,   /* swap R and B */
+    FLT_BLUE_HILIGHT,/* blue_region_highlight: tint blue pixels cyan */
+    FLT_SOBEL,       /* 3x3 Sobel gradient magnitude (post-pass) */
+    FLT_LAPLACIAN,   /* 4-neighbor Laplacian sharpen (post-pass) */
+    FLT_DILATE,      /* 3x3 max filter on gray (post-pass) */
+    FLT_ERODE,       /* 3x3 min filter on gray (post-pass) */
+    FLT_OTSU,        /* Otsu auto-threshold binarize (two-pass) */
+    FLT_COUNT
+} filter_t;
+static volatile filter_t g_filter = FLT_NONE;
+
+static const char *filter_name(filter_t f) {
+    switch (f) {
+    case FLT_NONE:        return "none (passthrough)";
+    case FLT_INVERT:      return "invert (negative)";
+    case FLT_GRAY:        return "grayscale";
+    case FLT_BINARIZE:    return "binarize (fixed 128)";
+    case FLT_HEATMAP:     return "heatmap (16-level)";
+    case FLT_LOWLIGHT:    return "lowlight enhance (gamma)";
+    case FLT_RED_ONLY:    return "red channel only";
+    case FLT_GREEN_ONLY:  return "green channel only";
+    case FLT_BLUE_ONLY:   return "blue channel only";
+    case FLT_BRIGHTER:    return "brighter (+64)";
+    case FLT_DARKER:      return "darker (-64)";
+    case FLT_CHAN_SWAP:   return "R<->B channel swap";
+    case FLT_BLUE_HILIGHT:return "blue region highlight";
+    case FLT_SOBEL:       return "Sobel edge (3x3)";
+    case FLT_LAPLACIAN:   return "Laplacian sharpen";
+    case FLT_DILATE:      return "dilation 3x3 gray";
+    case FLT_ERODE:       return "erosion 3x3 gray";
+    case FLT_OTSU:        return "Otsu auto-binarize";
+    default:              return "?";
+    }
+}
+
+/* Gamma LUT (gamma=0.5) for lowlight enhance -- compact version of
+ * the Verilog ROM.  Approximation: out = sqrt(in/255)*255. */
+static const uint8_t gamma05_lut[256] = {
+      0, 16, 22, 28, 32, 36, 39, 42, 45, 48, 50, 53, 55, 58, 60, 62,
+     64, 66, 68, 70, 71, 73, 75, 77, 78, 80, 81, 83, 85, 86, 88, 89,
+     90, 92, 93, 95, 96, 97, 99,100,101,103,104,105,106,108,109,110,
+    111,112,114,115,116,117,118,119,120,121,122,124,125,126,127,128,
+    129,130,131,132,133,134,135,136,137,138,139,140,141,142,143,143,
+    144,145,146,147,148,149,150,151,152,152,153,154,155,156,157,158,
+    158,159,160,161,162,162,163,164,165,166,166,167,168,169,170,170,
+    171,172,173,173,174,175,176,176,177,178,179,179,180,181,181,182,
+    183,184,184,185,186,186,187,188,188,189,190,190,191,192,192,193,
+    194,194,195,196,196,197,198,198,199,199,200,201,201,202,203,203,
+    204,204,205,206,206,207,208,208,209,209,210,211,211,212,212,213,
+    214,214,215,215,216,216,217,218,218,219,219,220,220,221,222,222,
+    223,223,224,224,225,226,226,227,227,228,228,229,229,230,231,231,
+    232,232,233,233,234,234,235,235,236,236,237,237,238,238,239,239,
+    240,241,241,242,242,243,243,244,244,245,245,246,246,247,247,248,
+    248,249,249,250,250,251,251,252,252,252,253,253,254,254,255,255,
+};
+
+/* 16-color heat-map LUT from threshold_region_segment.v (R,G,B). */
+static const uint8_t heatmap_lut[16][3] = {
+    {0x00,0x00,0x33}, {0x00,0x00,0x66}, {0x00,0x33,0xcc}, {0x00,0x66,0xcc},
+    {0x00,0x99,0xcc}, {0x00,0xcc,0xcc}, {0x00,0xcc,0x99}, {0x00,0xcc,0x66},
+    {0x66,0xcc,0x00}, {0x99,0xcc,0x00}, {0xcc,0xcc,0x00}, {0xff,0xcc,0x00},
+    {0xff,0x99,0x00}, {0xff,0x66,0x00}, {0xff,0x33,0x00}, {0xff,0x00,0x00},
+};
+
+/* Cacheable line buffers for 3x3 post-pass kernel ops.
+ * Holds three grayscale rows so we only need one non-cache
+ * framebuffer read per pixel. */
+static uint8_t g_gray_rows[3][FB_W];
+
+/* Integer RGB -> Y(luminance) with coeffs matching the RTL (76,150,29). */
+static inline uint8_t rgb2y(uint8_t r, uint8_t g, uint8_t b) {
+    uint32_t s = (uint32_t)r*76 + (uint32_t)g*150 + (uint32_t)b*29;
+    return (uint8_t)(s >> 8);
+}
+
+static inline uint8_t sat8(int v) {
+    return v < 0 ? 0 : (v > 255 ? 255 : (uint8_t)v);
+}
+
+/* ---- post-pass kernels over the just-written framebuffer ---- */
+
+/* Convert whole back-frame to grayscale in-place (needed before 3x3 gray ops). */
+static void fb_to_gray_in_place(uint8_t *fb) {
+    for (int y = 0; y < FB_H; y++) {
+        uint8_t *row = fb + y * STRIDE;
+        for (int x = 0; x < FB_W; x++) {
+            uint8_t r = row[x*4 + 0];
+            uint8_t g = row[x*4 + 1];
+            uint8_t b = row[x*4 + 2];
+            uint8_t Y = rgb2y(r,g,b);
+            row[x*4 + 0] = Y;
+            row[x*4 + 1] = Y;
+            row[x*4 + 2] = Y;
+        }
+    }
+}
+
+/* Load one framebuffer row into a cache-friendly gray strip. */
+static void load_gray_row(const uint8_t *fb, int y, uint8_t *dst) {
+    const uint8_t *row = fb + y * STRIDE;
+    for (int x = 0; x < FB_W; x++) {
+        dst[x] = rgb2y(row[x*4+0], row[x*4+1], row[x*4+2]);
+    }
+}
+
+static void apply_sobel(uint8_t *fb) {
+    load_gray_row(fb, 0, g_gray_rows[0]);
+    load_gray_row(fb, 1, g_gray_rows[1]);
+    for (int y = 1; y < FB_H - 1; y++) {
+        load_gray_row(fb, y + 1, g_gray_rows[(y+1) % 3]);
+        const uint8_t *r0 = g_gray_rows[(y-1) % 3];
+        const uint8_t *r1 = g_gray_rows[y % 3];
+        const uint8_t *r2 = g_gray_rows[(y+1) % 3];
+        uint8_t *out = fb + y * STRIDE;
+        /* borders left alone */
+        for (int x = 1; x < FB_W - 1; x++) {
+            int gx = -(int)r0[x-1] - 2*(int)r1[x-1] - (int)r2[x-1]
+                    +(int)r0[x+1] + 2*(int)r1[x+1] + (int)r2[x+1];
+            int gy =  (int)r0[x-1] + 2*(int)r0[x] + (int)r0[x+1]
+                    - (int)r2[x-1] - 2*(int)r2[x] - (int)r2[x+1];
+            int m = (gx < 0 ? -gx : gx) + (gy < 0 ? -gy : gy);
+            if (m > 255) m = 255;
+            uint8_t v = (uint8_t)m;
+            out[x*4+0] = v; out[x*4+1] = v; out[x*4+2] = v;
+        }
+    }
+}
+
+static void apply_laplacian(uint8_t *fb) {
+    load_gray_row(fb, 0, g_gray_rows[0]);
+    load_gray_row(fb, 1, g_gray_rows[1]);
+    for (int y = 1; y < FB_H - 1; y++) {
+        load_gray_row(fb, y + 1, g_gray_rows[(y+1) % 3]);
+        const uint8_t *r0 = g_gray_rows[(y-1) % 3];
+        const uint8_t *r1 = g_gray_rows[y % 3];
+        const uint8_t *r2 = g_gray_rows[(y+1) % 3];
+        uint8_t *out = fb + y * STRIDE;
+        for (int x = 1; x < FB_W - 1; x++) {
+            int c = r1[x];
+            /* lap = 5*c - (up + down + left + right), strength 2 like RTL */
+            int lap = 5*c - (int)r0[x] - (int)r2[x] - (int)r1[x-1] - (int)r1[x+1];
+            int v = c + (lap << 1);  /* strength=2 */
+            out[x*4+0] = out[x*4+1] = out[x*4+2] = sat8(v);
+        }
+    }
+}
+
+static void apply_dilate(uint8_t *fb) {
+    load_gray_row(fb, 0, g_gray_rows[0]);
+    load_gray_row(fb, 1, g_gray_rows[1]);
+    for (int y = 1; y < FB_H - 1; y++) {
+        load_gray_row(fb, y + 1, g_gray_rows[(y+1) % 3]);
+        const uint8_t *r0 = g_gray_rows[(y-1) % 3];
+        const uint8_t *r1 = g_gray_rows[y % 3];
+        const uint8_t *r2 = g_gray_rows[(y+1) % 3];
+        uint8_t *out = fb + y * STRIDE;
+        for (int x = 1; x < FB_W - 1; x++) {
+            uint8_t m = r0[x-1];
+            if (r0[x  ] > m) m = r0[x  ];
+            if (r0[x+1] > m) m = r0[x+1];
+            if (r1[x-1] > m) m = r1[x-1];
+            if (r1[x  ] > m) m = r1[x  ];
+            if (r1[x+1] > m) m = r1[x+1];
+            if (r2[x-1] > m) m = r2[x-1];
+            if (r2[x  ] > m) m = r2[x  ];
+            if (r2[x+1] > m) m = r2[x+1];
+            out[x*4+0] = out[x*4+1] = out[x*4+2] = m;
+        }
+    }
+}
+
+static void apply_erode(uint8_t *fb) {
+    load_gray_row(fb, 0, g_gray_rows[0]);
+    load_gray_row(fb, 1, g_gray_rows[1]);
+    for (int y = 1; y < FB_H - 1; y++) {
+        load_gray_row(fb, y + 1, g_gray_rows[(y+1) % 3]);
+        const uint8_t *r0 = g_gray_rows[(y-1) % 3];
+        const uint8_t *r1 = g_gray_rows[y % 3];
+        const uint8_t *r2 = g_gray_rows[(y+1) % 3];
+        uint8_t *out = fb + y * STRIDE;
+        for (int x = 1; x < FB_W - 1; x++) {
+            uint8_t m = r0[x-1];
+            if (r0[x  ] < m) m = r0[x  ];
+            if (r0[x+1] < m) m = r0[x+1];
+            if (r1[x-1] < m) m = r1[x-1];
+            if (r1[x  ] < m) m = r1[x  ];
+            if (r1[x+1] < m) m = r1[x+1];
+            if (r2[x-1] < m) m = r2[x-1];
+            if (r2[x  ] < m) m = r2[x  ];
+            if (r2[x+1] < m) m = r2[x+1];
+            out[x*4+0] = out[x*4+1] = out[x*4+2] = m;
+        }
+    }
+}
+
+/* Classic Otsu: histogram -> maximise between-class variance. */
+static uint8_t otsu_threshold(const uint8_t *fb) {
+    uint32_t hist[256] = {0};
+    for (int y = 0; y < FB_H; y++) {
+        const uint8_t *row = fb + y * STRIDE;
+        for (int x = 0; x < FB_W; x++) {
+            hist[ rgb2y(row[x*4+0], row[x*4+1], row[x*4+2]) ]++;
+        }
+    }
+    uint32_t total = (uint32_t)FB_W * FB_H;
+    uint64_t sum_all = 0;
+    for (int i = 0; i < 256; i++) sum_all += (uint64_t)i * hist[i];
+    uint32_t wB = 0;
+    uint64_t sumB = 0;
+    uint64_t best_var = 0;
+    uint8_t  best_t = 128;
+    for (int t = 0; t < 256; t++) {
+        wB += hist[t];
+        if (wB == 0) continue;
+        uint32_t wF = total - wB;
+        if (wF == 0) break;
+        sumB += (uint64_t)t * hist[t];
+        uint64_t mB = sumB / wB;
+        uint64_t mF = (sum_all - sumB) / wF;
+        uint64_t diff = (mB > mF) ? (mB - mF) : (mF - mB);
+        uint64_t var = (uint64_t)wB * wF * diff * diff;
+        if (var > best_var) { best_var = var; best_t = (uint8_t)t; }
+    }
+    return best_t;
+}
+
+static void apply_otsu(uint8_t *fb) {
+    uint8_t t = otsu_threshold(fb);
+    for (int y = 0; y < FB_H; y++) {
+        uint8_t *row = fb + y * STRIDE;
+        for (int x = 0; x < FB_W; x++) {
+            uint8_t Y = rgb2y(row[x*4+0], row[x*4+1], row[x*4+2]);
+            uint8_t v = (Y > t) ? 255 : 0;
+            row[x*4+0] = row[x*4+1] = row[x*4+2] = v;
+        }
+    }
+}
+
+/* Dispatch post-pass filters on completed back frame. */
+static void apply_post_pass(filter_t f, uint8_t *fb) {
+    switch (f) {
+    case FLT_SOBEL:     apply_sobel(fb);     break;
+    case FLT_LAPLACIAN: apply_laplacian(fb); break;
+    case FLT_DILATE:    apply_dilate(fb);    break;
+    case FLT_ERODE:     apply_erode(fb);     break;
+    case FLT_OTSU:      apply_otsu(fb);      break;
+    default: break;
+    }
+}
+
+static void print_filter_help(void) {
+    xil_printf("\r\n[filter] UART control: press a key to switch filter.\r\n");
+    xil_printf("  0/n : none (passthrough)\r\n");
+    xil_printf("  i   : invert\r\n");
+    xil_printf("  g   : grayscale\r\n");
+    xil_printf("  b   : binarize 128\r\n");
+    xil_printf("  h   : heatmap (16-level)\r\n");
+    xil_printf("  l   : lowlight enhance (gamma)\r\n");
+    xil_printf("  r/x/w : R/G/B channel only\r\n");
+    xil_printf("  +/- : brightness +/- 64\r\n");
+    xil_printf("  y   : R<->B channel swap\r\n");
+    xil_printf("  u   : blue region highlight\r\n");
+    xil_printf("  s   : Sobel edge (post-pass, slower)\r\n");
+    xil_printf("  p   : Laplacian sharpen (post-pass)\r\n");
+    xil_printf("  d   : dilation 3x3 (post-pass)\r\n");
+    xil_printf("  e   : erosion 3x3 (post-pass)\r\n");
+    xil_printf("  o   : Otsu auto-binarize (post-pass)\r\n");
+    xil_printf("  ?   : this help\r\n");
+}
+
+static void set_filter(filter_t f) {
+    g_filter = f;
+    xil_printf("[filter] -> %s\r\n", filter_name(f));
+}
+
+static void handle_uart_cmd(int c) {
+    switch (c) {
+    case '0': case 'n': case 'N': set_filter(FLT_NONE);        break;
+    case 'i': case 'I':           set_filter(FLT_INVERT);      break;
+    case 'g': case 'G':           set_filter(FLT_GRAY);        break;
+    case 'b': case 'B':           set_filter(FLT_BINARIZE);    break;
+    case 'h': case 'H':           set_filter(FLT_HEATMAP);     break;
+    case 'l': case 'L':           set_filter(FLT_LOWLIGHT);    break;
+    case 'r': case 'R':           set_filter(FLT_RED_ONLY);    break;
+    case 'x': case 'X':           set_filter(FLT_GREEN_ONLY);  break;
+    case 'w': case 'W':           set_filter(FLT_BLUE_ONLY);   break;
+    case '+': case '=':           set_filter(FLT_BRIGHTER);    break;
+    case '-': case '_':           set_filter(FLT_DARKER);      break;
+    case 'y': case 'Y':           set_filter(FLT_CHAN_SWAP);   break;
+    case 'u': case 'U':           set_filter(FLT_BLUE_HILIGHT);break;
+    case 's': case 'S':           set_filter(FLT_SOBEL);       break;
+    case 'p': case 'P':           set_filter(FLT_LAPLACIAN);   break;
+    case 'd': case 'D':           set_filter(FLT_DILATE);      break;
+    case 'e': case 'E':           set_filter(FLT_ERODE);       break;
+    case 'o': case 'O':           set_filter(FLT_OTSU);        break;
+    case '?':                     print_filter_help();         break;
+    default: break;
+    }
+}
+
+/* ========== DP configuration (from Phase 1) ========== */
+typedef enum { LANE_COUNT_1=1, LANE_COUNT_2=2 } LaneCount_t;
+typedef enum { LINK_RATE_162GBPS=0x06, LINK_RATE_270GBPS=0x0A, LINK_RATE_540GBPS=0x14 } LinkRate_t;
+typedef struct {
+    XDpPsu *DpPsuPtr; XAVBuf *AVBufPtr; XDpDma *DpDmaPtr;
+    XVidC_VideoMode VideoMode; XVidC_ColorDepth Bpc; XDpPsu_ColorEncoding ColorEncode;
+    u8 UseMaxLaneCount; u8 UseMaxLinkRate; u8 LaneCount; u8 LinkRate; u8 EnSynchClkMode; u32 PixClkHz;
+} Run_Config;
+
+/* Double-buffered framebuffers: CPU writes the "back" while DPDMA reads
+ * the "front".  Both live in NORM_NONCACHE .framebuffer section. */
+__attribute__((aligned(256), section(".framebuffer"))) u8 Frames[2][BUFFERSIZE];
+/* Per Xilinx wiki: BOTH the DpDma struct (contains embedded descriptors)
+ * AND the framebuffer must be in NORM_NONCACHE memory. .framebuffer is
+ * NOLOAD so we memset to zero before the driver touches them. */
+__attribute__((aligned(256), section(".framebuffer"))) XDpDma DpDma;
+__attribute__((aligned(256), section(".framebuffer"))) XDpDma_FrameBuffer FrameBuffers[2];
+static volatile int g_back  = 1;   /* CPU writes to Frames[g_back] */
+static volatile int g_front = 0;   /* DPDMA currently displays Frames[g_front] */
+XDpPsu DpPsu; XAVBuf AVBuf; Run_Config RunCfg;
+
+static void InitRunConfig(Run_Config *c) {
+    c->DpPsuPtr=&DpPsu; c->AVBufPtr=&AVBuf; c->DpDmaPtr=&DpDma;
+    c->VideoMode=XVIDC_VM_1280x720_60_P; c->Bpc=XVIDC_BPC_8; c->ColorEncode=XDPPSU_CENC_RGB;
+    c->UseMaxLaneCount=1; c->UseMaxLinkRate=1; c->LaneCount=LANE_COUNT_2;
+    c->LinkRate=LINK_RATE_540GBPS; c->EnSynchClkMode=0;
+}
+
+static int InitDpDmaSubsystem(Run_Config *cfg) {
+    XDpPsu_Config *DpCfg = XDpPsu_LookupConfig(XPAR_PSU_DP_DEVICE_ID);
+    XDpPsu_CfgInitialize(cfg->DpPsuPtr, DpCfg, DpCfg->BaseAddr);
+    XAVBuf_CfgInitialize(cfg->AVBufPtr, cfg->DpPsuPtr->Config.BaseAddr, XPAR_PSU_DP_DEVICE_ID);
+    XDpDma_Config *DmaCfg = XDpDma_LookupConfig(XPAR_XDPDMA_0_DEVICE_ID);
+    XDpDma_CfgInitialize(cfg->DpDmaPtr, DmaCfg);
+    if (XDpPsu_InitializeTx(cfg->DpPsuPtr) != XST_SUCCESS) return XST_FAILURE;
+    XDpDma_SetGraphicsFormat(cfg->DpDmaPtr, RGBA8888);
+    XAVBuf_SetInputNonLiveGraphicsFormat(cfg->AVBufPtr, RGBA8888);
+    XDpDma_SetQOS(cfg->DpDmaPtr, 11);
+    XAVBuf_EnableGraphicsBuffers(cfg->AVBufPtr, 1);
+    XAVBuf_SetOutputVideoFormat(cfg->AVBufPtr, RGB_8BPC);
+    XAVBuf_InputVideoSelect(cfg->AVBufPtr, XAVBUF_VIDSTREAM1_NONE, XAVBUF_VIDSTREAM2_NONLIVE_GFX);
+    XAVBuf_ConfigureGraphicsPipeline(cfg->AVBufPtr);
+    XAVBuf_ConfigureOutputVideo(cfg->AVBufPtr);
+    XAVBuf_SetBlenderAlpha(cfg->AVBufPtr, 0, 0);
+    XDpPsu_CfgMsaEnSynchClkMode(cfg->DpPsuPtr, cfg->EnSynchClkMode);
+    XAVBuf_SetAudioVideoClkSrc(cfg->AVBufPtr, XAVBUF_PS_CLK, XAVBUF_PS_CLK);
+    XAVBuf_SoftReset(cfg->AVBufPtr);
+    return XST_SUCCESS;
+}
+
+static u32 DpPsu_Wakeup(Run_Config *cfg) {
+    u8 d = 0x1;
+    XDpPsu_AuxWrite(cfg->DpPsuPtr, XDPPSU_DPCD_SET_POWER_DP_PWR_VOLTAGE, 1, &d);
+    return XDpPsu_AuxWrite(cfg->DpPsuPtr, XDPPSU_DPCD_SET_POWER_DP_PWR_VOLTAGE, 1, &d);
+}
+static u32 DpPsu_HpdTrain(Run_Config *cfg) {
+    XDpPsu *Dp = cfg->DpPsuPtr;
+    if (XDpPsu_GetRxCapabilities(Dp) != XST_SUCCESS) return XST_FAILURE;
+    XDpPsu_SetEnhancedFrameMode(Dp, Dp->LinkConfig.SupportEnhancedFramingMode ? 1 : 0);
+    XDpPsu_SetLaneCount(Dp, Dp->LinkConfig.MaxLaneCount);
+    XDpPsu_SetLinkRate(Dp, Dp->LinkConfig.MaxLinkRate);
+    XDpPsu_SetDownspread(Dp, Dp->LinkConfig.SupportDownspreadControl);
+    return XDpPsu_EstablishLink(Dp);
+}
+static void DpPsu_SetupVideoStream(Run_Config *cfg) {
+    XDpPsu *Dp = cfg->DpPsuPtr;
+    XDpPsu_SetColorEncode(Dp, cfg->ColorEncode);
+    XDpPsu_CfgMsaSetBpc(Dp, cfg->Bpc);
+    XDpPsu_CfgMsaUseStandardVideoMode(Dp, cfg->VideoMode);
+    cfg->PixClkHz = Dp->MsaConfig.PixelClockHz;
+    XAVBuf_SetPixelClock(cfg->PixClkHz);
+    XDpPsu_WriteReg(Dp->Config.BaseAddr, XDPPSU_SOFT_RESET, 0x1);
+    usleep(10);
+    XDpPsu_WriteReg(Dp->Config.BaseAddr, XDPPSU_SOFT_RESET, 0x0);
+    XDpPsu_SetMsaValues(Dp);
+    XDpPsu_WriteReg(Dp->Config.BaseAddr, 0xB124, 0x3);
+    usleep(10);
+    XDpPsu_WriteReg(Dp->Config.BaseAddr, 0xB124, 0x0);
+    XDpPsu_EnableMainLink(Dp, 1);
+}
+
+/* ========== Initial pattern (before first image arrives) ========== */
+static void FillWaitingPattern(u8 *fb) {
+    u32 *p = (u32*)fb;
+    const int W=FB_W, H=FB_H;
+    for (int y=0; y<H; y++) {
+        for (int x=0; x<W; x++) {
+            // Dark blue bg + yellow "WAITING FOR IMAGE" style bars
+            u8 r=0x10, g=0x10, b=0x50;
+            if (y > H/2-30 && y < H/2+30) { r=0xFF; g=0xFF; b=0x00; }  // yellow band
+            p[y*W+x] = 0xFF000000 | (b<<16) | (g<<8) | r;
+        }
+    }
+}
+
+/* ========== Image receive protocol state machine ========== */
+typedef enum { S_HDR, S_DATA } rx_state_t;
+static rx_state_t g_state = S_HDR;
+static uint8_t g_hdr[16];
+static uint32_t g_hdr_got = 0;
+static uint32_t g_w, g_h, g_fmt, g_expect;
+static uint32_t g_got;
+static uint32_t g_frames_received = 0;
+
+static err_t img_recv_cb(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err) {
+    (void)arg;
+    if (!p) { tcp_close(tpcb); return ERR_OK; }
+    if (err != ERR_OK) { pbuf_free(p); return err; }
+    tcp_recved(tpcb, p->tot_len);
+
+    struct pbuf *q;
+    for (q = p; q; q = q->next) {
+        const uint8_t *bytes = (uint8_t*)q->payload;
+        uint32_t remain = q->len;
+        while (remain > 0) {
+            if (g_state == S_HDR) {
+                uint32_t need = 16 - g_hdr_got;
+                uint32_t take = remain < need ? remain : need;
+                memcpy(&g_hdr[g_hdr_got], bytes, take);
+                g_hdr_got += take;
+                bytes += take; remain -= take;
+                if (g_hdr_got == 16) {
+                    if (!(g_hdr[0]=='I' && g_hdr[1]=='M' && g_hdr[2]=='G' && g_hdr[3]==0)) {
+                        xil_printf("[img] bad magic, resync\r\n");
+                        g_hdr_got = 0;
+                        continue;
+                    }
+                    g_w = g_hdr[4] | (g_hdr[5]<<8) | (g_hdr[6]<<16) | (g_hdr[7]<<24);
+                    g_h = g_hdr[8] | (g_hdr[9]<<8) | (g_hdr[10]<<16) | (g_hdr[11]<<24);
+                    g_fmt = g_hdr[12] | (g_hdr[13]<<8) | (g_hdr[14]<<16) | (g_hdr[15]<<24);
+                    g_expect = g_w * g_h * 4;  /* RGBA8888 */
+                    g_got = 0;
+                    g_state = S_DATA;
+                }
+            } else {  /* S_DATA */
+                uint32_t need = g_expect - g_got;
+                uint32_t take = remain < need ? remain : need;
+                /* Write bytes into the BACK framebuffer with an inline
+                 * per-pixel transform selected by g_filter.  Slow post-
+                 * pass kernel filters (Sobel/Laplacian/...) just memcpy
+                 * here; their processing runs after the full frame. */
+                if (g_got + take <= BUFFERSIZE) {
+                    uint8_t *fb = Frames[g_back];
+                    uint32_t base = g_got;
+                    filter_t f = g_filter;
+                    /* Fast path: memcpy for filters handled post-pass. */
+                    if (f == FLT_NONE || f == FLT_SOBEL || f == FLT_LAPLACIAN
+                        || f == FLT_DILATE || f == FLT_ERODE || f == FLT_OTSU) {
+                        memcpy(fb + base, bytes, take);
+                    } else {
+                        /* Inline byte-stream transform with pixel alignment.
+                         * g_pix_r/g holds R, G from current incomplete pixel
+                         * so filters that need all 3 channels (gray, swap,
+                         * binarize) can fix up when B arrives. */
+                        static uint8_t g_pix_r = 0, g_pix_g = 0;
+                        if ((base & 3) == 0) { g_pix_r = 0; g_pix_g = 0; }
+                        for (uint32_t i = 0; i < take; i++) {
+                            uint32_t abs = base + i;
+                            uint32_t bi  = abs & 3;  /* 0=R 1=G 2=B 3=A */
+                            uint8_t  v   = bytes[i];
+                            uint8_t  o   = v;
+                            switch (f) {
+                            case FLT_INVERT:
+                                o = (bi == 3) ? v : (uint8_t)(255 - v);
+                                break;
+                            case FLT_BRIGHTER: {
+                                int t = (bi == 3) ? v : (int)v + 64;
+                                o = (t > 255) ? 255 : (uint8_t)t;
+                                break;
+                            }
+                            case FLT_DARKER: {
+                                int t = (bi == 3) ? v : (int)v - 64;
+                                o = (t < 0) ? 0 : (uint8_t)t;
+                                break;
+                            }
+                            case FLT_RED_ONLY:
+                                o = (bi == 0) ? v : (bi == 3 ? 255 : 0);
+                                break;
+                            case FLT_GREEN_ONLY:
+                                o = (bi == 1) ? v : (bi == 3 ? 255 : 0);
+                                break;
+                            case FLT_BLUE_ONLY:
+                                o = (bi == 2) ? v : (bi == 3 ? 255 : 0);
+                                break;
+                            case FLT_GRAY: {
+                                if (bi == 0) { g_pix_r = v; o = v; }
+                                else if (bi == 1) { g_pix_g = v; o = v; }
+                                else if (bi == 2) {
+                                    uint8_t Y = rgb2y(g_pix_r, g_pix_g, v);
+                                    /* backfill R and G of this pixel */
+                                    fb[abs - 2] = Y;
+                                    fb[abs - 1] = Y;
+                                    o = Y;
+                                } else o = v;
+                                break;
+                            }
+                            case FLT_BINARIZE: {
+                                if (bi == 0) { g_pix_r = v; o = v; }
+                                else if (bi == 1) { g_pix_g = v; o = v; }
+                                else if (bi == 2) {
+                                    uint8_t Y = rgb2y(g_pix_r, g_pix_g, v);
+                                    uint8_t b = (Y > 128) ? 255 : 0;
+                                    fb[abs - 2] = b;
+                                    fb[abs - 1] = b;
+                                    o = b;
+                                } else o = v;
+                                break;
+                            }
+                            case FLT_HEATMAP: {
+                                if (bi == 0) { g_pix_r = v; o = v; }
+                                else if (bi == 1) { g_pix_g = v; o = v; }
+                                else if (bi == 2) {
+                                    uint8_t Y = rgb2y(g_pix_r, g_pix_g, v);
+                                    uint32_t idx = Y >> 4;   /* /16 */
+                                    fb[abs - 2] = heatmap_lut[idx][0];
+                                    fb[abs - 1] = heatmap_lut[idx][1];
+                                    o          = heatmap_lut[idx][2];
+                                } else o = v;
+                                break;
+                            }
+                            case FLT_LOWLIGHT:
+                                o = (bi == 3) ? v : gamma05_lut[v];
+                                break;
+                            case FLT_CHAN_SWAP: {
+                                if (bi == 0) { g_pix_r = v; o = v; }
+                                else if (bi == 2) {
+                                    /* new blue becomes old red, red was stored */
+                                    fb[abs - 2] = v;        /* R <- B */
+                                    o = g_pix_r;            /* B <- R */
+                                } else o = v;
+                                break;
+                            }
+                            case FLT_BLUE_HILIGHT: {
+                                /* Tint pixels that are strongly blue
+                                 * (B > R+30 && B > G+30) to bright cyan. */
+                                if (bi == 0) { g_pix_r = v; o = v; }
+                                else if (bi == 1) { g_pix_g = v; o = v; }
+                                else if (bi == 2) {
+                                    int R = g_pix_r, G = g_pix_g, B = v;
+                                    if (B > R + 30 && B > G + 30) {
+                                        fb[abs - 2] = 0;
+                                        fb[abs - 1] = 255;
+                                        o = 255;
+                                    } else o = v;
+                                } else o = v;
+                                break;
+                            }
+                            default: o = v; break;
+                            }
+                            fb[abs] = o;
+                        }
+                        /* Suppress unused-variable on code path skipping
+                         * the per-byte loop. */
+                        (void)g_pix_r; (void)g_pix_g;
+                        goto data_advance;
+                    }
+                    (void)0;  /* fall-through for fast memcpy path */
+                }
+            data_advance:
+                g_got += take;
+                bytes += take; remain -= take;
+                if (g_got == g_expect) {
+                    g_frames_received++;
+                    /* Run post-pass kernel filter (Sobel/Laplacian/...). */
+                    apply_post_pass(g_filter, Frames[g_back]);
+                    /* Swap DPDMA to the newly-filled buffer. */
+                    XDpDma_DisplayGfxFrameBuffer(RunCfg.DpDmaPtr, &FrameBuffers[g_back]);
+                    XDpDma_SetupChannel(RunCfg.DpDmaPtr, GraphicsChan);
+                    XDpDma_Trigger(RunCfg.DpDmaPtr, GraphicsChan);
+                    g_front = g_back;
+                    g_back  = 1 - g_back;
+                    g_hdr_got = 0;
+                    g_state = S_HDR;
+                }
+            }
+        }
+    }
+    pbuf_free(p);
+    return ERR_OK;
+}
+
+static err_t tcp_accept_cb(void *arg, struct tcp_pcb *newpcb, err_t err) {
+    (void)arg; (void)err;
+    xil_printf("[tcp] accept from %d.%d.%d.%d:%d\r\n",
+               ip4_addr1(&newpcb->remote_ip), ip4_addr2(&newpcb->remote_ip),
+               ip4_addr3(&newpcb->remote_ip), ip4_addr4(&newpcb->remote_ip),
+               newpcb->remote_port);
+    tcp_recv(newpcb, img_recv_cb);
+    /* Reset state machine on each new connection for safety */
+    g_state = S_HDR;
+    g_hdr_got = 0;
+    return ERR_OK;
+}
+
+static void start_tcp_server(void) {
+    struct tcp_pcb *pcb = tcp_new();
+    tcp_bind(pcb, IP_ADDR_ANY, 5000);
+    pcb = tcp_listen(pcb);
+    tcp_accept(pcb, tcp_accept_cb);
+    xil_printf("[tcp] image server listening on port 5000\r\n");
+    xil_printf("      protocol: IMG\\0 + w(4) + h(4) + fmt(4) + w*h*4 bytes RGBA\r\n");
+}
+
+/* ========== main ========== */
+static struct netif server_netif;
+static unsigned char mac_ethernet_address[6] = { 0x00, 0x0A, 0x35, 0x00, 0xFC, 0x3A };
+
+int main(void) {
+    /* Cache strategy:
+     *  - D-cache stays ENABLED so lwIP/memcpy/TCP run at full speed
+     *  - 8 MB region 0x10000000..0x10800000 is marked NORM_NONCACHE
+     *    via Xil_SetTlbAttributes; DpDma + FrameBuffer + Frame[] all live
+     *    in this region (via .framebuffer section)
+     *
+     * Order (per Xilinx wiki):
+     *  1. Flush D-cache so any stale lines from cstartup are written back
+     *  2. Change TLB attributes
+     *  3. Full barrier
+     *  4. memset the NOLOAD region structs
+     *  5. Proceed with driver init - all subsequent descriptor writes
+     *     bypass cache and land in DDR directly.
+     */
+    Xil_DCacheFlush();
+    for (uint64_t a = 0x10000000ULL; a < 0x10800000ULL; a += 0x200000ULL) {
+        Xil_SetTlbAttributes(a, NORM_NONCACHE);
+    }
+    __asm__ volatile("dsb sy; isb" ::: "memory");
+    memset(&DpDma, 0, sizeof(DpDma));
+    memset(&FrameBuffers, 0, sizeof(FrameBuffers));
+    __asm__ volatile("dsb sy" ::: "memory");
+    xil_printf("\r\n===========================================\r\n");
+    xil_printf("  FZ3A Phase 2b: Network image -> DP display\r\n");
+    xil_printf("===========================================\r\n");
+
+    /* 1. Fill BOTH framebuffers with the "waiting" pattern so whichever
+     *    DPDMA reads first, we see the pattern.  Buffer-1 will get
+     *    overwritten by the first incoming TCP frame. */
+    FillWaitingPattern(Frames[0]);
+    FillWaitingPattern(Frames[1]);
+
+    /* 2. Bring up DP */
+    xil_printf("Init DP subsystem...\r\n");
+    InitRunConfig(&RunCfg);
+    if (InitDpDmaSubsystem(&RunCfg) != XST_SUCCESS) {
+        xil_printf("DP init FAIL\r\n"); while (1) __asm__ volatile("wfe");
+    }
+    for (int i = 0; i < 2; i++) {
+        FrameBuffers[i].Address  = (INTPTR)Frames[i];
+        FrameBuffers[i].Stride   = STRIDE;
+        FrameBuffers[i].LineSize = LINESIZE;
+        FrameBuffers[i].Size     = BUFFERSIZE;
+    }
+
+    /* Wait for HPD and train */
+    xil_printf("DP: waiting for HPD...\r\n");
+    int hpd = 0;
+    for (int i = 0; i < 30; i++) {
+        if (XDpPsu_IsConnected(RunCfg.DpPsuPtr)) { hpd = 1; break; }
+        usleep(100000);
+    }
+    if (hpd) {
+        xil_printf("DP: HPD high, training link...\r\n");
+        XDpPsu_EnableMainLink(RunCfg.DpPsuPtr, 0);
+        DpPsu_Wakeup(&RunCfg);
+        for (int r = 0; r < 3; r++) {
+            usleep(100000);
+            if (DpPsu_HpdTrain(&RunCfg) != XST_SUCCESS) continue;
+            extern void XDpDma_SetupChannel(XDpDma *InstancePtr, XDpDma_ChannelType Channel);
+            XDpDma_SetChannelState(RunCfg.DpDmaPtr, GraphicsChan, XDPDMA_ENABLE);
+            XDpDma_DisplayGfxFrameBuffer(RunCfg.DpDmaPtr, &FrameBuffers[0]);
+            XDpDma_SetupChannel(RunCfg.DpDmaPtr, GraphicsChan);
+            XDpDma_SetChannelState(RunCfg.DpDmaPtr, GraphicsChan, XDPDMA_ENABLE);
+            XDpDma_Trigger(RunCfg.DpDmaPtr, GraphicsChan);
+            DpPsu_SetupVideoStream(&RunCfg);
+            xil_printf("DP: video streaming OK\r\n");
+            break;
+        }
+    } else {
+        xil_printf("DP: HPD never went high (monitor?), continuing anyway\r\n");
+    }
+
+    xil_printf("DP init done\r\n");
+
+    /* 3. GIC + lwIP + TCP server */
+    xil_printf("GIC setup...\r\n");
+    Xil_ExceptionInit();
+    XScuGic_DeviceInitialize(XPAR_SCUGIC_0_DEVICE_ID);
+    Xil_ExceptionRegisterHandler(XIL_EXCEPTION_ID_IRQ_INT,
+        (Xil_ExceptionHandler)XScuGic_DeviceInterruptHandler,
+        (void*)XPAR_SCUGIC_0_DEVICE_ID);
+    Xil_ExceptionEnable();
+
+    xil_printf("lwip_init...\r\n");
+    lwip_init();
+
+    ip_addr_t zero;
+    IP4_ADDR(&zero, 0, 0, 0, 0);
+    if (!xemac_add(&server_netif, &zero, &zero, &zero,
+                   mac_ethernet_address, XPAR_XEMACPS_0_BASEADDR)) {
+        xil_printf("xemac_add FAIL\r\n"); while (1) __asm__ volatile("wfe");
+    }
+    netif_set_default(&server_netif);
+    netif_set_up(&server_netif);
+
+    xil_printf("dhcp_start...\r\n");
+    dhcp_start(&server_netif);
+    int tries = 0;
+    while (!dhcp_supplied_address(&server_netif) && tries < 100) {
+        xemacif_input(&server_netif);
+        sys_check_timeouts();
+        usleep(100000);
+        tries++;
+    }
+    if (dhcp_supplied_address(&server_netif)) {
+        xil_printf("DHCP OK: %d.%d.%d.%d\r\n",
+                   ip4_addr1(&server_netif.ip_addr), ip4_addr2(&server_netif.ip_addr),
+                   ip4_addr3(&server_netif.ip_addr), ip4_addr4(&server_netif.ip_addr));
+    } else {
+        xil_printf("DHCP timeout, fallback to 192.168.6.210\r\n");
+        ip_addr_t ip, nm, gw;
+        IP4_ADDR(&ip, 192, 168, 6, 210);
+        IP4_ADDR(&nm, 255, 255, 255, 0);
+        IP4_ADDR(&gw, 192, 168, 6, 1);
+        netif_set_addr(&server_netif, &ip, &nm, &gw);
+    }
+
+    start_tcp_server();
+    print_filter_help();
+
+    /* 4. Main loop: drain lwIP queue + poll UART for filter commands */
+    xil_printf("entering main loop\r\n");
+    uint32_t tick = 0;
+    while (1) {
+        int c = uart_rx_poll();
+        if (c >= 0) handle_uart_cmd(c);
+        xemacif_input(&server_netif);
+        sys_check_timeouts();
+        tick++;
+        if (tick % 2000000 == 0) {
+            xil_printf("alive, link=%d, frames_rx=%d\r\n",
+                       netif_is_link_up(&server_netif), g_frames_received);
+        }
+    }
+    return 0;
+}
