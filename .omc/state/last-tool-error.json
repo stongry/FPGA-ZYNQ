@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"cp /tmp/fz3a_dp/phase2b_main.c /tmp/fz3a_dp/mnist_weights.h /tmp/fz3a_dp/mnist_weights.npz /tmp/fz3a_dp/mnist_train_export.py /tmp/fz3a_dp/send_digit.py /tmp/fz3a_dp/build.ps1 ~/fz3a_dp_sn...",
+  "error": "Exit code 1\ncp: 是否覆盖 '/home/ysara/fz3a_dp_snapshot_20260409/phase2b_main.c'？cp: 是否覆盖 '/home/ysara/fz3a_dp_snapshot_20260409/build.ps1'？",
+  "timestamp": "2026-04-09T16:12:46.788Z",
+  "retry_count": 1
+}

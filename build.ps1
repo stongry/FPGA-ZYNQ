@@ -10,7 +10,7 @@ $lib  = "$bsp\lib"
   "-L$lib" `
   '-Wl,--start-group' `
   phase2b_main.c stubs.c `
-  -lxil -llwip4 -lgcc -lc `
+  -lxil -llwip4 -lgcc -lc -lm `
   '-Wl,--end-group' `
   -o phase2b.elf 2>&1 | Tee-Object build.log
 Write-Host "EXIT=$LASTEXITCODE"

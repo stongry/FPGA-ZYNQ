@@ -229,4 +229,78 @@ windows_artifacts/
 - **摄像头路径**: 用非 NVIDIA Broadcast 的 Windows 或 Linux 主机抓 cam
 
 ---
-归档时间: 2026-04-09 23:53 GMT+8
+
+## Phase 2e: MNIST 手写数字 CNN 识别（追加 2026-04-10 00:12）
+
+仿照 `~/Desktop/zynq_cnn_dp_full.zip` 中的 zynq_cnn_dp 项目，做了一个
+完整的手写数字识别流水线，**和视频流、滤镜、UART 控制共存**。
+
+### 网络架构 —— 2 层 MLP
+
+```
+Input: 784 (28×28 u8 flatten) / 255.0
+   │
+   ▼  W1 (64×784)  +  b1 (64)
+[HIDDEN=64] + ReLU
+   │
+   ▼  W2 (10×64)  +  b2 (10)
+[logits 10] + stable softmax
+   │
+   ▼  argmax
+预测数字 0-9
+```
+
+参数量：50826 float32 ≈ **200 KB** 嵌入二进制
+
+### 训练（`mnist_train_export.py`，纯 numpy）
+
+- 数据集：MNIST 标准 60000 train + 10000 test，从 `storage.googleapis.com/cvdf-datasets/mnist/` 下载 + 本地缓存
+- 初始化：He-normal
+- 优化：SGD lr=0.1 batch=128 × 8 epoch
+- 训练耗时：**131 秒**（numpy 纯 CPU）
+- 导出：FP32 `mnist_weights.h` (622 KB 文本) + `mnist_weights.npz` (399 KB 二进制缓存)
+
+### 板侧推理（`phase2b_main.c` 中 `mnist_infer`）
+
+- 纯 C float32 实现，调用 `expf` for softmax（需 `-lm`）
+- TCP 服务 on **port 5001**：
+  - Req:  `MNI\0` + w(4)=28 + h(4)=28 + fmt(4) + 784 bytes u8 灰度
+  - Resp: `CLS\0` + pred(1) + pad(3) + 10 × float32 probs = 48 bytes
+- UART 同步打印 `[cnn] #N -> digit D (conf X%)`
+- **和视频流 port 5000 共用 lwIP 主循环**，零互相影响
+
+### Host 客户端（`send_digit.py`）
+
+- PIL 加载任意 PNG，resize → 28×28 灰度
+- 自动反相检测（MNIST 是黑底白字，PIL 默认读白底）
+- 单张模式 + `all` 批量模式（自动对比文件名 truth 并统计精度）
+
+### **实测结果**
+
+| 指标 | 值 |
+|---|---|
+| Host 训练精度 (MNIST test set 10000 张) | **96.11 %** |
+| 板侧端到端精度 (20 张随机测试图) | **95.0 %** (19/20) |
+| 单张推理延迟 (板侧 A53 @ 1.2 GHz) | **0.9 ms** 纯计算 / 4.5-4.8 ms 含 TCP 往返 |
+| elf 尺寸 | 938920 → **1148848** 字节（+210 KB 权重）|
+| 唯一误判 | truth=5 被识别成 6（置信度 98.1%）|
+
+20 张测试的 top-1 置信度分布：大多数 >99%，最低 81.9%（truth=3 → pred=3 正确）
+
+### 存档新增文件
+
+```
+mnist_train_export.py   # 训练脚本
+mnist_weights.h         # 622 KB 权重头文件
+mnist_weights.npz       # numpy 缓存（避免重训）
+send_digit.py           # 客户端
+digit_pngs/             # 20 张 MNIST 测试 PNG
+phase2b_main.c          # 加 mnist_infer + port 5001 server
+build.ps1               # 加 -lm
+windows_artifacts/
+  phase2b.elf           # 更新为 1148848 bytes 版
+```
+
+---
+归档时间: 2026-04-10 00:12 GMT+8（Phase 2e MNIST 追加）
+原归档时间: 2026-04-09 23:53 GMT+8
