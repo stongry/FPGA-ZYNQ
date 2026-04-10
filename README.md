@@ -86,44 +86,72 @@
 ## 文件结构
 
 ```
-├── phase2b_main.c           # 主固件 (裸机 C, ~1200 行)
-│                              ├── DP 初始化 + DPDMA 双缓冲
-│                              ├── lwIP TCP 服务器 (端口 5000/5001/5002)
-│                              ├── 17 种图像滤镜 (内联 + 后处理)
-│                              ├── CNN TinyLeNet PL 推理接口
-│                              ├── PED HOG+SVM PL 推理接口
-│                              └── Filter HLS PL 加速接口
+├── README.md
 │
-├── cnn_hls_kernel.cpp        # CNN HLS 加速器源码
-├── cnn_hls_weights.h         # CNN INT8 量化权重 (TinyLeNet, 98.83% acc)
+├── firmware/                     # 裸机固件
+│   ├── phase2b_main.c            #   主程序 (~1200 行): DP + TCP + 滤镜 + CNN/PED 接口
+│   ├── stubs.c                   #   Newlib stubs
+│   ├── lscript.ld                #   链接脚本
+│   ├── lwipopts.h                #   lwIP 配置
+│   └── build.ps1                 #   Windows 交叉编译脚本
 │
-├── ped_hls_kernel.cpp        # 行人检测 HLS 加速器源码
-├── ped_hls_weights.h         # SVM INT8 权重 (Penn-Fudan trained)
-├── ped_svm_info.json         # SVM 训练信息
+├── hls/                          # Vitis HLS 加速器源码 (C++ → Verilog)
+│   ├── cnn_hls_kernel.cpp        #   TinyLeNet CNN 推理
+│   ├── cnn_hls_weights.h         #   CNN INT8 量化权重 (98.83% acc)
+│   ├── ped_hls_kernel.cpp        #   HOG+SVM 行人检测
+│   ├── ped_hls_weights.h         #   SVM INT8 权重 (Penn-Fudan, 86.4% CV)
+│   ├── ped_svm_info.json         #   SVM 训练元数据
+│   ├── filter_hls_kernel.cpp     #   视频滤镜 (burst-optimized)
+│   ├── mnist_data.h              #   INT8 单层权重 (legacy HLS matmul)
+│   └── cnn_scales.txt            #   量化 scale 参数
 │
-├── filter_hls_kernel.cpp     # 视频滤镜 HLS 加速器源码 (burst-optimized)
+├── rtl/                          # Verilog RTL
+│   ├── generated/                #   HLS 自动生成 (Vitis HLS → Vivado)
+│   │   ├── cnn/                  #     CNN: 67 个 Verilog 模块
+│   │   ├── ped/                  #     PED: 15 个 Verilog 模块
+│   │   └── filter/               #     Filter: 31 个 Verilog 模块
+│   └── handwritten/              #   手写 RTL (教学参考)
+│       └── cnn/                  #     9 个模块: cnn_top, conv_layer, fc_layer 等
 │
-├── mnist_weights.h           # PS 侧 float32 MLP 权重 (fallback)
-├── mnist_data.h              # PS 侧 INT8 单层权重 (legacy)
-├── mnist_train_export.py     # MNIST 训练 + C 头文件导出
+├── drivers/                      # lwIP 以太网驱动补丁
+│   ├── xemacpsif.c
+│   ├── xemacpsif_dma.c
+│   ├── xemacpsif_hw.c
+│   ├── xemacpsif_physpeed.c      #   KSZ9031 PHY read-only 模式
+│   └── xadapter.c
 │
-├── send_digit.py             # CNN 推理测试客户端
-├── send_ped.py               # 行人检测测试客户端
-├── stream_video.py           # 视频流客户端 (Linux)
-├── stream_video_win.py       # 视频流客户端 (Windows)
-├── stream_desktop.py         # 桌面屏幕流
-├── stream_rtsp.py            # RTSP 中转流
-├── stream_test.py            # 合成测试图案流
+├── scripts/                      # 部署/构建脚本
+│   ├── boot_phase2b.tcl          #   XSDB 部署 (PSU init + ELF download)
+│   ├── hotdow.tcl                #   热下载脚本
+│   ├── add_lwip.tcl              #   BSP lwIP 配置
+│   └── *.bat                     #   Windows 流媒体启动脚本
 │
-├── build.ps1                 # Windows 交叉编译脚本
-├── stubs.c                   # Newlib stubs
-├── lscript.ld                # 链接脚本
+├── clients/                      # Python 测试客户端
+│   ├── send_digit.py             #   CNN 数字识别 (端口 5001)
+│   ├── send_ped.py               #   行人检测 (端口 5002)
+│   ├── stream_video.py           #   视频文件流 (端口 5000, Linux)
+│   ├── stream_video_win.py       #   视频文件流 (Windows)
+│   ├── stream_desktop.py         #   桌面屏幕流
+│   ├── stream_rtsp.py            #   RTSP 中转流
+│   ├── cam_to_fz3a.py            #   摄像头流
+│   └── stream_test*.py           #   合成测试图案
 │
-├── boot_phase2b.tcl          # XSDB 部署脚本 (PSU init + ELF download)
-├── windows_artifacts/
-│   └── phase2b.elf           # 预编译固件二进制
+├── training/                     # 模型训练
+│   ├── mnist_train_export.py     #   MNIST MLP 训练 + C 导出
+│   ├── mnist_weights.h           #   float32 MLP 权重 (PS fallback)
+│   └── mnist_weights.npz         #   NumPy 权重缓存
 │
-└── digit_pngs/               # MNIST 测试图片 (20 张)
+├── test_data/                    # 测试数据
+│   ├── digit_pngs/               #   20 张 MNIST 测试图
+│   └── test_video.mp4            #   测试视频
+│
+├── docs/                         # 历史阶段参考源码
+│   ├── dp_main.c                 #   Phase 1: DP 显示
+│   ├── eth_main.c                #   Phase 2a: 以太网
+│   └── ref_*.c                   #   Xilinx 参考实现
+│
+└── windows_artifacts/            # 预编译二进制
+    └── phase2b.elf               #   最终固件 (~1.15 MB)
 ```
 
 ## 实现细节
