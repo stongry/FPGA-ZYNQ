@@ -48,9 +48,9 @@
 #define AP_DONE   (1U << 1)
 #define AP_IDLE   (1U << 2)
 
-/* Inference engine selector: 0=PS float32, 1=HLS matmul INT8, 2=CNN TinyLeNet */
-static volatile int g_infer_mode = 2;
-static const char *infer_mode_name[] = {"PS (float32)", "PL-HLS (INT8)", "PL-CNN (TinyLeNet)"};
+/* Inference engine selector: 0=PS float32, 1=PL-CNN TinyLeNet */
+static volatile int g_infer_mode = 1;
+static const char *infer_mode_name[] = {"PS (float32)", "PL-CNN (TinyLeNet)"};
 
 /* ========== CNN TinyLeNet HLS accelerator MMIO ========== */
 /* Register map from Vitis HLS generated driver (xcnn_tinylenet_hls_hw.h) */
@@ -487,7 +487,7 @@ static void handle_uart_cmd(int c) {
     case 'e': case 'E':           set_filter(FLT_ERODE);       break;
     case 'o': case 'O':           set_filter(FLT_OTSU);        break;
     case 'm': case 'M':
-        g_infer_mode = (g_infer_mode + 1) % 3;
+        g_infer_mode = (g_infer_mode + 1) % 2;
         xil_printf("[cnn] MNIST engine -> %s\r\n", infer_mode_name[g_infer_mode]);
         break;
     case '?':                     print_filter_help();         break;
@@ -863,11 +863,10 @@ static uint32_t g_mnist_count = 0;
 static void mnist_run_and_reply(struct tcp_pcb *tpcb) {
     uint8_t pred;
     float probs[10];
-    switch (g_infer_mode) {
-    case 1:  mnist_infer_pl(g_mnist_buf, &pred, probs);  break;
-    case 2:  mnist_infer_cnn(g_mnist_buf, &pred, probs); break;
-    default: mnist_infer(g_mnist_buf, &pred, probs);     break;
-    }
+    if (g_infer_mode == 1)
+        mnist_infer_cnn(g_mnist_buf, &pred, probs);
+    else
+        mnist_infer(g_mnist_buf, &pred, probs);
     g_mnist_count++;
 
     /* format reply: "CLS\0" + pred(1) + pad(3) + 10 * float32 */
@@ -965,6 +964,143 @@ static void start_mnist_server(void) {
     xil_printf("[cnn] MNIST inference server listening on port 5001\r\n");
     xil_printf("      protocol: MNI\\0 + w(4)=28 + h(4)=28 + fmt(4) + 784 bytes u8\r\n");
     xil_printf("      reply:    CLS\\0 + pred(1) + pad(3) + 10 * float32 probs\r\n");
+}
+
+/* ========== PED: HOG+SVM Pedestrian Detector on PL ========== */
+#define PED_IMG_W  320
+#define PED_IMG_H  240
+#define PED_IMG_SIZE (PED_IMG_W * PED_IMG_H)  /* 76800 */
+#define PED_MAX_DETS 16
+
+#ifndef PED_BASE
+#define PED_BASE       0xA0030000UL  /* Vivado assigned: /ped_hls/s_axi_ctrl/Reg */
+#endif
+#define PED_AP_CTRL       (*(volatile uint32_t*)(PED_BASE + 0x00000))
+#define PED_NUM_DETS      (*(volatile uint32_t*)(PED_BASE + 0x00010))
+#define PED_THRESHOLD     (*(volatile uint32_t*)(PED_BASE + 0x00020))
+#define PED_DET(i)        (*(volatile int32_t*)(PED_BASE + 0x00080 + 4*(i)))
+#define PED_IMAGE_WORD(i) (*(volatile uint32_t*)(PED_BASE + 0x20000 + 4*(i)))
+#define PED_AP_START (1U << 0)
+#define PED_AP_DONE  (1U << 1)
+#define PED_AP_IDLE  (1U << 2)
+
+/* PED TCP state machine (port 5002)
+ * Protocol:
+ *   client -> board:  "PED\0" + w(4)=320 + h(4)=240 + fmt(4) + 76800 bytes u8
+ *   board  -> client: "DET\0" + n_dets(4) + n_dets * {x(2)+y(2)+score(4)} */
+#define PED_HDR_BYTES 16
+
+typedef enum { P_HDR, P_DATA } ped_state_t;
+static ped_state_t g_ped_state = P_HDR;
+static uint8_t  g_ped_hdr[PED_HDR_BYTES];
+static uint32_t g_ped_hdr_got = 0;
+static uint8_t  g_ped_buf[PED_IMG_SIZE];
+static uint32_t g_ped_got = 0;
+static uint32_t g_ped_count = 0;
+
+static void ped_run_and_reply(struct tcp_pcb *tpcb) {
+    /* Test: write just 1 word to PED control area, then try image area */
+    PED_THRESHOLD = 100;  /* write to offset 0x20, should be safe */
+    /* Now try writing first image word at offset 0x20000 */
+    PED_IMAGE_WORD(0) = pack4u(&g_ped_buf[0]);
+    /* Write image packed 4 bytes per word */
+    for (int i = 0; i < PED_IMG_SIZE / 4; i++)
+        PED_IMAGE_WORD(i) = pack4u(&g_ped_buf[i * 4]);
+
+    /* Set threshold and trigger */
+    PED_THRESHOLD = 0;
+    PED_AP_CTRL = PED_AP_START;
+
+    /* Poll until done */
+    for (volatile int t = 0; t < 50000000; t++)
+        if (PED_AP_CTRL & PED_AP_DONE) break;
+
+    int n_dets = (int)PED_NUM_DETS;
+    if (n_dets > PED_MAX_DETS) n_dets = PED_MAX_DETS;
+    g_ped_count++;
+
+    /* Reply: "DET\0" + n_dets(4) + n_dets * {pos_word(4) + score_word(4)} */
+    uint8_t rep[8 + PED_MAX_DETS * 8];
+    rep[0] = 'D'; rep[1] = 'E'; rep[2] = 'T'; rep[3] = 0;
+    memcpy(&rep[4], &n_dets, 4);
+    for (int i = 0; i < n_dets; i++) {
+        int32_t pos   = PED_DET(i * 2);
+        int32_t score = PED_DET(i * 2 + 1);
+        memcpy(&rep[8 + i * 8], &pos, 4);
+        memcpy(&rep[8 + i * 8 + 4], &score, 4);
+    }
+    int reply_len = 8 + n_dets * 8;
+    tcp_write(tpcb, rep, reply_len, TCP_WRITE_FLAG_COPY);
+    tcp_output(tpcb);
+
+    xil_printf("[ped] #%d -> %d detections\r\n", g_ped_count, n_dets);
+}
+
+static err_t ped_recv_cb(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err)
+{
+    (void)arg;
+    if (!p) { tcp_close(tpcb); return ERR_OK; }
+    if (err != ERR_OK) { pbuf_free(p); return err; }
+    tcp_recved(tpcb, p->tot_len);
+
+    for (struct pbuf *q = p; q; q = q->next) {
+        const uint8_t *bytes = (const uint8_t *)q->payload;
+        uint32_t remain = q->len;
+        while (remain > 0) {
+            if (g_ped_state == P_HDR) {
+                uint32_t need = PED_HDR_BYTES - g_ped_hdr_got;
+                uint32_t take = remain < need ? remain : need;
+                memcpy(&g_ped_hdr[g_ped_hdr_got], bytes, take);
+                g_ped_hdr_got += take;
+                bytes += take; remain -= take;
+                if (g_ped_hdr_got == PED_HDR_BYTES) {
+                    if (!(g_ped_hdr[0] == 'P' && g_ped_hdr[1] == 'E' &&
+                          g_ped_hdr[2] == 'D' && g_ped_hdr[3] == 0)) {
+                        xil_printf("[ped] bad magic, reset\r\n");
+                        g_ped_hdr_got = 0;
+                        continue;
+                    }
+                    g_ped_got = 0;
+                    g_ped_state = P_DATA;
+                }
+            } else {
+                uint32_t need = PED_IMG_SIZE - g_ped_got;
+                uint32_t take = remain < need ? remain : need;
+                memcpy(&g_ped_buf[g_ped_got], bytes, take);
+                g_ped_got += take;
+                bytes += take; remain -= take;
+                if (g_ped_got == PED_IMG_SIZE) {
+                    ped_run_and_reply(tpcb);
+                    g_ped_hdr_got = 0;
+                    g_ped_state = P_HDR;
+                }
+            }
+        }
+    }
+    pbuf_free(p);
+    return ERR_OK;
+}
+
+static err_t ped_accept_cb(void *arg, struct tcp_pcb *newpcb, err_t err) {
+    (void)arg; (void)err;
+    xil_printf("[ped] accept from %d.%d.%d.%d\r\n",
+               ip4_addr1(&newpcb->remote_ip), ip4_addr2(&newpcb->remote_ip),
+               ip4_addr3(&newpcb->remote_ip), ip4_addr4(&newpcb->remote_ip));
+    tcp_recv(newpcb, ped_recv_cb);
+    g_ped_state   = P_HDR;
+    g_ped_hdr_got = 0;
+    g_ped_got     = 0;
+    return ERR_OK;
+}
+
+static void start_ped_server(void) {
+    struct tcp_pcb *pcb = tcp_new();
+    tcp_bind(pcb, IP_ADDR_ANY, 5002);
+    pcb = tcp_listen(pcb);
+    tcp_accept(pcb, ped_accept_cb);
+    xil_printf("[ped] Pedestrian detection server on port 5002\r\n");
+    xil_printf("      protocol: PED\\0 + w(4)=320 + h(4)=240 + fmt(4) + 76800 bytes u8\r\n");
+    xil_printf("      reply:    DET\\0 + n(4) + n * {pos(4)+score(4)}\r\n");
 }
 
 /* ========== main ========== */
@@ -1092,6 +1228,7 @@ int main(void) {
 
     start_tcp_server();
     start_mnist_server();
+    start_ped_server();
     print_filter_help();
 
     /* 4. Main loop: drain lwIP queue + poll UART for filter commands */
