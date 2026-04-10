@@ -1,0 +1,10 @@
+{
+  "num_features": 3780,
+  "scale": 2.4509876658997015e-05,
+  "bias_fp32": -0.001000214950370746,
+  "bias_q": -4081,
+  "train_accuracy": 1.0,
+  "cv_accuracy": 0.8637515425750719,
+  "num_pos": 830,
+  "num_neg": 271
+}
