@@ -1,306 +1,358 @@
-# FZ3A 裸机视频流 DP 显示项目 —— 存档 2026-04-09
+# FZ3A Zynq UltraScale+ FPGA — 实时视频流 + PL 加速 CNN/行人检测/图像滤镜
 
-ALINX FZ3A (Xilinx XCZU3EG ZynqMP) 裸机 bare-metal 项目，从 0 做到
-**千兆 TCP → DPDMA → mini DP @ 30 fps** 实时视频流，并在 A53 CPU 侧
-实现 17 个图像处理滤镜，UART 串口实时切换。
+基于 ALINX FZ3A 开发板（Xilinx XCZU3EG ZynqMP），从零搭建的裸机（bare-metal）嵌入式视觉系统。实现了千兆以太网实时视频流、DisplayPort 显示输出，以及三个 FPGA PL 侧硬件加速器：CNN 手写数字识别、HOG+SVM 行人检测、实时图像滤镜。
 
-## 最终达成指标
-
-| 项 | 值 |
-|---|---|
-| DP 输出分辨率 | 1280×720 @ 60 Hz RGBA8888 |
-| 网络吞吐（TCP raw RGBA） | **108 MB/s ≈ 864 Mbps**（千兆效率 ≈ 91%） |
-| 合成源帧率（testsrc2, Linux 侧）| **29.3 fps** |
-| Windows MP4 文件流 | **26.8 fps**（IMG_2039.MOV H.264 1920×1072）|
-| RTSP 中转 | 24-25 fps |
-| 双缓冲无撕裂 | ✅（Trigger-per-frame mode）|
-| FPGA PL 资源占用 | < 4%（DP/GEM3/DPDMA 都走 PS 硬核） |
-
-## 项目阶段
-
-1. **Phase 1**: 板载 JTAG 连接验证 → Vivado BSP 导出 → Vitis 裸机 DP 1280×720 彩条显示
-2. **Phase 1.5**: MNIST 手写识别 PS+PL 分离（HLS 加速器）
-3. **Phase 2a**: lwIP 2.2.0 + xemacps_v3_21 Ethernet bring-up，KSZ9031 PHY read-only 模式，DHCP，TCP echo server
-4. **Phase 2b**: 单帧网络图像 → DP 显示（`send_image.py`）
-5. **Phase 2c**: 实时视频流（`stream_test.py` / `stream_desktop.py` / `stream_rtsp.py` / `stream_video_win.py`）
-6. **Phase 2d**: 双缓冲无撕裂 + UART 串口控制 + **17 种图像处理滤镜**（移植自 b3/v22v Verilog RTL 工程）
-
-## 关键技术突破
-
-### 1. D-cache + DPDMA 协同工作（Xilinx 官方 example 没做的事）
-
-Xilinx 的 `xdpdma_video_example.c` 粗暴地 `Xil_DCacheDisable()`，因为 DPDMA
-描述符是嵌在 `XDpDma` struct 里的，D-cache 开启时 CPU 写描述符到 cache 不
-同步到 DDR，DPDMA 硬件读到陈旧数据 → 黑屏。
-
-正确解法（phase2b_main.c 开头）：
-
-```c
-/* 1. Flush 启动残留 cache lines */
-Xil_DCacheFlush();
-
-/* 2. 把 8 MB framebuffer 区标成 NORM_NONCACHE */
-for (uint64_t a = 0x10000000; a < 0x10800000; a += 0x200000)
-    Xil_SetTlbAttributes(a, NORM_NONCACHE);
-
-/* 3. 全屏障 */
-__asm__ volatile("dsb sy; isb" ::: "memory");
-
-/* 4. memset DpDma/FrameBuffers 清零（.framebuffer NOLOAD 不会自动清） */
-memset(&DpDma, 0, sizeof(DpDma));
-memset(&FrameBuffers, 0, sizeof(FrameBuffers));
-
-/* 5. 继续 DP 驱动初始化 —— 描述符写 DDR 直达，lwIP/memcpy 继续享用 cache */
-```
-
-把 `XDpDma DpDma` + `XDpDma_FrameBuffer FrameBuffers[2]` + `u8 Frames[2][...]`
-全部放进 `.framebuffer` section（linker 映射到 `ddr_fb @ 0x10000000`），
-整个 DP 数据路径绕开 cache，lwIP/TCP/memcpy 全速享受 cache。
-
-### 2. 双缓冲消撕裂
-
-`Frames[2]` + `FrameBuffers[2]`：CPU 写 back 时 DPDMA 读 front。
-帧写完调用 `XDpDma_DisplayGfxFrameBuffer + SetupChannel + Trigger` 切换描述符。
-三调用缺一不可（Trigger 不调会撕裂，SetupChannel 不调 SRC_ADDR 不更新）。
+## 系统架构
 
 ```
-front = g_front (DPDMA reading)
-back  = g_back  (CPU writing via memcpy)
-frame complete → Trigger swap → front := back, back := 1 - back
+                          ┌─────────────────────────────────────────────┐
+                          │              FPGA PL (可编程逻辑)             │
+  PC/Camera ──TCP 5000──▶ │  ┌─────────────────────────────────────┐   │
+  1280×720 RGBA @ 30fps   │  │  Video Filter HLS (Sobel/Lap/...)  │   │──▶ DisplayPort
+                          │  │  m_axi DMA, burst-optimized        │   │    1280×720@60Hz
+  PC ────────TCP 5001──▶ │  ├─────────────────────────────────────┤   │
+  28×28 digit image       │  │  CNN TinyLeNet HLS                 │   │
+                          │  │  Conv→Pool→Conv→Pool→FC→FC→Argmax  │   │
+  PC ────────TCP 5002──▶ │  ├─────────────────────────────────────┤   │
+  320×240 grayscale       │  │  PED HOG+SVM HLS                   │   │
+                          │  │  Gradient→HOG→SlidingWindow→SVM    │   │
+                          │  └─────────────────────────────────────┘   │
+                          ├─────────────────────────────────────────────┤
+                          │              PS (ARM Cortex-A53)            │
+                          │  lwIP TCP/IP ─ DPDMA ─ GIC ─ UART         │
+                          └─────────────────────────────────────────────┘
 ```
 
-### 3. KSZ9031 PHY read-only 模式
+## 性能指标
 
-Xilinx xemacpsif 默认不识别 Micrel OUI，写 MDIO 会打断已 Linux-init 好
-的 link。解决：加 Micrel ID `0x0022`，只从 reg 0x0A bit 11 读
-1000BASE-T FD 结果，**不写任何 PHY 寄存器**。
-
-参见 `xemacpsif_physpeed.c` 的 `get_Micrel_phy_speed()`。
-
-## 文件清单
-
-### 板侧源码（/ 开发主机 Linux）
-
-```
-phase2b_main.c        # 主应用（DP+lwIP+TCP+双缓冲+17 滤镜+UART 控制）
-stubs.c               # newlib syscalls + sys_now() for lwIP
-lscript.ld            # 链接器：ddr_low 0x00100000 + ddr_fb 0x10000000/8MB
-xemacpsif_physpeed.c  # 打过补丁的 PHY 检测（KSZ9031 read-only 模式）
-lwipopts.h            # lwIP 调优（TCP_WND=64K, MEM_SIZE=512K, 256 desc）
-build.ps1             # Windows 侧 aarch64-none-elf-gcc 编译脚本
-```
-
-### xsdb 启动/下载脚本
-
-```
-boot_phase2b.tcl      # 冷启动：rst -system + psu_init + dow elf + con
-hotdow.tcl            # 热下载：targets 9 + rst -processor + dow + con
-list_targets.tcl      # 列 xsdb targets
-regen_bsp.tcl         # 重建 BSP
-```
-
-### 发送端脚本
-
-```
-Linux 侧:
-  send_image.py          # 发单张图
-  stream_test.py         # ffmpeg lavfi testsrc2/smptebars/mandelbrot
-  stream_desktop.py      # x11grab 桌面流
-  stream_rtsp.py         # RTSP 中转（`rtsp://192.168.6.162:8554/live`）
-  stream_video.py        # 本地视频文件
-
-Windows 侧:
-  stream_video_win.py    # 视频文件流（零拷贝 bytearray 优化）
-  stream_test_win.py     # testsrc2 合成
-  cam_ff_to_fz3a.py      # dshow 摄像头（被 NVIDIA Broadcast 挡了，未跑通）
-  cam_to_fz3a.py         # OpenCV MSMF 摄像头备用
-  play_2039.bat          # 启动器（task scheduler 用）
-  run_video.bat / run_cam.bat / run_mandel.bat
-```
-
-### Windows 产物
-
-```
-windows_artifacts/
-  phase2b.elf            # 最终编译产物 938920 字节
-  boot_phase2b.tcl       # 冷启动脚本（带 rst -system -clear-registers）
-  hotdow.tcl             # 热下载脚本
-  play_2039.bat          # IMG_2039.MOV loop 播放
-  *.tcl                  # 各种调试脚本
-```
-
-## 滤镜清单（phase2b_main.c）
-
-所有算法移植自 `E:\Linux\nanjing\b3\v22v\video640 19fps\UDP_EG4_6.2\source_code\rtl\`
-中的 Verilog RTL 模块。按 UART 串口单字符触发：
-
-| Key | 滤镜 | 路径 | 对应 RTL |
-|---|---|---|---|
-| `0`/`n` | 直通 | direct memcpy | - |
-| `i` | 反色 negative | inline | - |
-| `g` | 灰度（RGB→Y 76/150/29）| inline w/ R/G buffering | 通用 |
-| `b` | 固定阈值二值化 | inline | - |
-| `h` | 16 色热力图 | inline LUT | `threshold_region_segment.v` |
-| `l` | 低光增强 gamma LUT | inline | `lowlight_enhance.v` |
-| `r`/`x`/`w` | 红/绿/蓝通道 only | inline | - |
-| `+`/`-` | 亮度 ±64 | inline | - |
-| `y` | R↔B channel swap | inline | - |
-| `u` | 蓝色区域高亮 | inline | `blue_region_highlight.v` (简化) |
-| `s` | Sobel 3×3 | post-pass | `sobel_filter.v` |
-| `p` | Laplacian 锐化 | post-pass strength=2 | `laplacian_sharpen.v` |
-| `d` | 3×3 膨胀 | post-pass | `dilation_filter_gray.v` |
-| `e` | 3×3 腐蚀 | post-pass | `erosion_filter_gray.v` |
-| `o` | Otsu 自动阈值 | two-pass | `otsu_binarize.v`（真 Otsu 算法） |
-| `?` | 打印帮助 | | |
-
-**inline 滤镜**（前 12 个）：每帧 25-26 fps，几乎无性能损失
-**post-pass 3×3 核**：每帧 10-12 fps（读写非缓存 framebuffer 开销）
-**Otsu**：8-10 fps（两遍扫描 + 直方图）
-
-## 运行步骤（冷启动到播放）
-
-1. **编译**（Windows cmd/PowerShell）：
-   ```cmd
-   powershell -ExecutionPolicy Bypass -File C:\Users\huye\fz3a\dp\build.ps1
-   ```
-
-2. **冷启动板子**（Windows）：
-   ```cmd
-   C:\Xilinx\Vitis\2024.2\bin\xsdb.bat C:\Users\huye\fz3a\dp\boot_phase2b.tcl
-   ```
-   板子启动后自动跑到 "entering main loop"，DHCP 拿 192.168.6.192，
-   TCP listen on 5000，DP 显示 waiting pattern (蓝+黄)。
-
-3. **推视频**（两种路径）：
-   - **Linux 主机**: `python3 /tmp/fz3a_dp/stream_test.py 192.168.6.192 30 testsrc2`
-   - **Windows**: `python -u C:\Users\huye\fz3a\dp\stream_video_win.py "D:\dw\IMG_2039.MOV" 192.168.6.192 30 loop`
-
-4. **切换滤镜** — 打开 COM9 @ 115200（PuTTY / Vitis Serial Monitor / MobaXterm），
-   按 `?` 看菜单，按 `i`/`g`/`s` 等字符实时切换。
-
-## 踩过的坑（按时间顺序）
-
-1. **JTAG 连接**: hw_server tcp:localhost:3121 + `targets 9` (A53#0)
-2. **BSP 重建**: Vitis 每次改 lwipopts/xlwipconfig 都要 `regen_bsp.tcl` 重编库
-3. **KSZ9031 PHY**: 默认 xemacpsif 不识别，写 MDIO 会杀 link → read-only 补丁
-4. **lwIP GIC**: 必须 `Xil_ExceptionInit + XScuGic_DeviceInitialize + ExceptionRegisterHandler + ExceptionEnable`，否则 ISR 不跑、BD 不 drain、`frames_rx=0`
-5. **DHCP 100 次循环**: fallback 192.168.6.210，但常规拿 192.168.6.192
-6. **D-cache 黑屏**: Xilinx 官方 example 直接禁 cache。正解 = 放 .framebuffer NOLOAD + NORM_NONCACHE TLB + memset + dsb/isb 屏障
-7. **.framebuffer NOLOAD 不清零**: 移 DpDma 进去后必须手动 memset，否则驱动看到垃圾
-8. **Windows 百兆限速**: 网卡协商到 100 Mbps 导致只有 13 MB/s，换线到 1 Gbps 后 94 MB/s
-9. **Windows Python sendall 慢**: `HEADER + buf` 拼接每帧 3.5 MB 内存 alloc+copy。优化：预分配 bytearray + memoryview + `readinto`，18.9 fps → 25 fps
-10. **NVIDIA Broadcast 独占摄像头**: 杀掉进程也自动重启，ffmpeg dshow 拿不到帧，最终放弃摄像头走视频文件路线
-11. **双缓冲的 Trigger**: 仅调 SetupChannel 不调 Trigger → 撕裂。三调用缺一不可
-12. **EDITR not ready**: recv_cb 死循环/竞态导致 A53 debug 接口卡死，只能物理 reset 板子
-13. **xsdb 的 UTF-8**: PowerShell 传参多层 escape，最终用 `.bat` 包装器更稳
-
-## 板卡 / 工具链
-
-- **板卡**: ALINX FZ3A (XCZU3EG-SFVC784-1-I ZynqMP), KSZ9031 GigE PHY, mini DP OUT, 2 GB DDR4
-- **开发主机**: Linux（我），远程 Windows（huye@192.168.6.244:2222）+ Vivado 2024.2 + Vitis 2024.2
-- **JTAG**: Digilent JTAG-SMT2 板载，FT4232H → tcp:localhost:3121
-- **工具链**: `C:\Xilinx\Vitis\2024.2\gnu\aarch64\nt\aarch64-none\bin\aarch64-none-elf-gcc.exe`
-- **BSP 路径**: `C:\Users\huye\fz3a\vitis_ws\fz3a_plat\psu_cortexa53_0\standalone_domain\bsp\psu_cortexa53_0\{lib,include}`
-- **FSBL/PMU 不需要**：直接用 xsdb `psu_init.tcl` 手动 bring-up DDR/clock/MIO
-
-## 性能对比
-
-| 场景 | FPS | 带宽 |
-|---|---:|---:|
-| Linux → testsrc2 | 29.3 | 108 MB/s |
-| Linux → RTSP 中转 | 24.5 | 87 MB/s |
-| Windows → testsrc2 | 26.5 | 98 MB/s |
-| Windows → 本地 MP4 | 26.8 | 99 MB/s |
-| 反色 inline | 25-26 | 93 MB/s |
-| 灰度 inline | 24-25 | 92 MB/s |
-| 热力图 inline | 24-25 | 92 MB/s |
-| 低光增强 inline | 22-24 | 88 MB/s |
-| 双缓冲 + Trigger-per-frame | 21-22 | 80 MB/s |
-| Sobel post-pass | 10-12 | 40 MB/s |
-| Laplacian post-pass | 10-12 | 40 MB/s |
-| Otsu two-pass | 8-10 | 35 MB/s |
-
-## 后续可做
-
-- **PL 硬件加速**: 把 3×3 核放进 FPGA HLS IP，消除 CPU post-pass 瓶颈
-- **DPDMA IRQ 驱动**: 真正的 VSYNC 同步 swap，彻底消撕裂 @ 30 fps
-- **H.264 解码 IP**: Windows 送压缩流，板子解码，10 MB/s 即可 1080p
-- **JPEG 压缩传输**: 减少 90% 带宽
-- **摄像头路径**: 用非 NVIDIA Broadcast 的 Windows 或 Linux 主机抓 cam
-
----
-
-## Phase 2e: MNIST 手写数字 CNN 识别（追加 2026-04-10 00:12）
-
-仿照 `~/Desktop/zynq_cnn_dp_full.zip` 中的 zynq_cnn_dp 项目，做了一个
-完整的手写数字识别流水线，**和视频流、滤镜、UART 控制共存**。
-
-### 网络架构 —— 2 层 MLP
-
-```
-Input: 784 (28×28 u8 flatten) / 255.0
-   │
-   ▼  W1 (64×784)  +  b1 (64)
-[HIDDEN=64] + ReLU
-   │
-   ▼  W2 (10×64)  +  b2 (10)
-[logits 10] + stable softmax
-   │
-   ▼  argmax
-预测数字 0-9
-```
-
-参数量：50826 float32 ≈ **200 KB** 嵌入二进制
-
-### 训练（`mnist_train_export.py`，纯 numpy）
-
-- 数据集：MNIST 标准 60000 train + 10000 test，从 `storage.googleapis.com/cvdf-datasets/mnist/` 下载 + 本地缓存
-- 初始化：He-normal
-- 优化：SGD lr=0.1 batch=128 × 8 epoch
-- 训练耗时：**131 秒**（numpy 纯 CPU）
-- 导出：FP32 `mnist_weights.h` (622 KB 文本) + `mnist_weights.npz` (399 KB 二进制缓存)
-
-### 板侧推理（`phase2b_main.c` 中 `mnist_infer`）
-
-- 纯 C float32 实现，调用 `expf` for softmax（需 `-lm`）
-- TCP 服务 on **port 5001**：
-  - Req:  `MNI\0` + w(4)=28 + h(4)=28 + fmt(4) + 784 bytes u8 灰度
-  - Resp: `CLS\0` + pred(1) + pad(3) + 10 × float32 probs = 48 bytes
-- UART 同步打印 `[cnn] #N -> digit D (conf X%)`
-- **和视频流 port 5000 共用 lwIP 主循环**，零互相影响
-
-### Host 客户端（`send_digit.py`）
-
-- PIL 加载任意 PNG，resize → 28×28 灰度
-- 自动反相检测（MNIST 是黑底白字，PIL 默认读白底）
-- 单张模式 + `all` 批量模式（自动对比文件名 truth 并统计精度）
-
-### **实测结果**
+### 视频流 + 滤镜
 
 | 指标 | 值 |
-|---|---|
-| Host 训练精度 (MNIST test set 10000 张) | **96.11 %** |
-| 板侧端到端精度 (20 张随机测试图) | **95.0 %** (19/20) |
-| 单张推理延迟 (板侧 A53 @ 1.2 GHz) | **0.9 ms** 纯计算 / 4.5-4.8 ms 含 TCP 往返 |
-| elf 尺寸 | 938920 → **1148848** 字节（+210 KB 权重）|
-| 唯一误判 | truth=5 被识别成 6（置信度 98.1%）|
+|------|------|
+| DP 输出分辨率 | 1280×720 @ 60Hz RGBA8888 |
+| 网络吞吐 (TCP raw RGBA) | **108 MB/s** (91% 千兆效率) |
+| 无滤镜帧率 | **31.7 fps** |
+| Sobel 边缘检测 (HLS PL) | **18.8 fps** (PS 软件仅 3.2 fps, **5.9x 加速**) |
+| 双缓冲无撕裂 | Trigger-per-frame mode |
+| 支持滤镜 | 17 种 (Sobel/Laplacian/膨胀/腐蚀/Otsu/灰度/反色/热力图/低光增强等) |
 
-20 张测试的 top-1 置信度分布：大多数 >99%，最低 81.9%（truth=3 → pred=3 正确）
+### CNN 手写数字识别 (端口 5001)
 
-### 存档新增文件
+| 指标 | 值 |
+|------|------|
+| 模型 | TinyLeNet: Conv1(5×5,8)→Pool→Conv2(5×5,16)→Pool→FC1(256→64)→FC2(64→10) |
+| 精度 | **100%** (20/20 测试集), 训练集 98.83% |
+| 推理延迟 | **3.7ms** (含 TCP 往返) |
+| 计算位置 | **纯 PL FPGA** (Vitis HLS), PS 仅做数据搬运 |
+| 量化 | INT8 权重, 嵌入 BRAM |
+| PL 资源 | 12% LUT, 8% BRAM, 22% DSP |
+
+### HOG+SVM 行人检测 (端口 5002)
+
+| 指标 | 值 |
+|------|------|
+| 算法 | HOG 梯度 + 8×8 cell 直方图 + 滑窗线性 SVM (3780 维) |
+| 输入 | 320×240 灰度图 |
+| 检测窗口 | 64×128 (Dalal-Triggs), 步长 8px, 495 个窗口 |
+| 帧处理时间 | **21.6ms** (~46 FPS) |
+| 训练数据 | Penn-Fudan Pedestrian Dataset, 交叉验证准确率 86.4% |
+| 计算位置 | **纯 PL FPGA**, 图像通过 m_axi DMA 从 DDR 读取 |
+
+## 硬件平台
+
+| 项 | 规格 |
+|----|------|
+| 开发板 | ALINX FZ3A |
+| SoC | Xilinx Zynq UltraScale+ XCZU3EG-SFVC784 |
+| PS | Quad-core ARM Cortex-A53 @ 1.2 GHz |
+| PL | 70K LUT, 141K FF, 288 BRAM18, 360 DSP48 |
+| DDR | 2GB DDR4 |
+| 视频输出 | mini DisplayPort |
+| 网络 | Gigabit Ethernet (KSZ9031 PHY) |
+| 调试 | JTAG (Digilent SMT2), UART (CP2102) |
+
+## 项目演进
+
+| Commit | 阶段 | 内容 | 关键指标 |
+|--------|------|------|----------|
+| `2124afd` | Phase 2d | 视频流 + 17 图像滤镜 | 29.3 fps, 108 MB/s |
+| `b080c46` | Phase 2e | PS 软件 MLP 推理 | 96% acc, 4.5ms |
+| `b6d43a5` | Phase 2f | PL HLS 单层 matmul | 93% acc, ~20µs |
+| `36851dc` | Phase 2g | **PL HLS TinyLeNet CNN** | 100% acc, 3.7ms |
+| `cd954c4` | Phase 2i | **PL HLS 行人检测** | 46 FPS, 21.6ms |
+| `f51133e` | Phase 2j | Penn-Fudan 真实训练 | 86.4% CV acc |
+| `e7d67cd` | Phase 2l | **Burst 优化 HLS 滤镜** | 18.8 fps (5.9x) |
+
+## 文件结构
 
 ```
-mnist_train_export.py   # 训练脚本
-mnist_weights.h         # 622 KB 权重头文件
-mnist_weights.npz       # numpy 缓存（避免重训）
-send_digit.py           # 客户端
-digit_pngs/             # 20 张 MNIST 测试 PNG
-phase2b_main.c          # 加 mnist_infer + port 5001 server
-build.ps1               # 加 -lm
-windows_artifacts/
-  phase2b.elf           # 更新为 1148848 bytes 版
+├── phase2b_main.c           # 主固件 (裸机 C, ~1200 行)
+│                              ├── DP 初始化 + DPDMA 双缓冲
+│                              ├── lwIP TCP 服务器 (端口 5000/5001/5002)
+│                              ├── 17 种图像滤镜 (内联 + 后处理)
+│                              ├── CNN TinyLeNet PL 推理接口
+│                              ├── PED HOG+SVM PL 推理接口
+│                              └── Filter HLS PL 加速接口
+│
+├── cnn_hls_kernel.cpp        # CNN HLS 加速器源码
+├── cnn_hls_weights.h         # CNN INT8 量化权重 (TinyLeNet, 98.83% acc)
+│
+├── ped_hls_kernel.cpp        # 行人检测 HLS 加速器源码
+├── ped_hls_weights.h         # SVM INT8 权重 (Penn-Fudan trained)
+├── ped_svm_info.json         # SVM 训练信息
+│
+├── filter_hls_kernel.cpp     # 视频滤镜 HLS 加速器源码 (burst-optimized)
+│
+├── mnist_weights.h           # PS 侧 float32 MLP 权重 (fallback)
+├── mnist_data.h              # PS 侧 INT8 单层权重 (legacy)
+├── mnist_train_export.py     # MNIST 训练 + C 头文件导出
+│
+├── send_digit.py             # CNN 推理测试客户端
+├── send_ped.py               # 行人检测测试客户端
+├── stream_video.py           # 视频流客户端 (Linux)
+├── stream_video_win.py       # 视频流客户端 (Windows)
+├── stream_desktop.py         # 桌面屏幕流
+├── stream_rtsp.py            # RTSP 中转流
+├── stream_test.py            # 合成测试图案流
+│
+├── build.ps1                 # Windows 交叉编译脚本
+├── stubs.c                   # Newlib stubs
+├── lscript.ld                # 链接脚本
+│
+├── boot_phase2b.tcl          # XSDB 部署脚本 (PSU init + ELF download)
+├── windows_artifacts/
+│   └── phase2b.elf           # 预编译固件二进制
+│
+└── digit_pngs/               # MNIST 测试图片 (20 张)
 ```
 
----
-归档时间: 2026-04-10 00:12 GMT+8（Phase 2e MNIST 追加）
-原归档时间: 2026-04-09 23:53 GMT+8
+## 实现细节
+
+### 1. 视频流管线
+
+```
+PC (ffmpeg/Python) ──TCP 5000──▶ lwIP TCP 接收 ──▶ 帧缓冲 (DDR 0x10000000)
+                                                         │
+                                              ┌──────────▼──────────┐
+                                              │  Filter HLS (可选)   │
+                                              │  m_axi burst 读写   │
+                                              └──────────┬──────────┘
+                                                         │
+                                              DPDMA 自动读取 ──▶ DisplayPort
+```
+
+**关键技术突破:**
+- **D-cache 与 DPDMA 共存**: 用 `NORM_NONCACHE` TLB 属性标记帧缓冲区域 (0x10000000-0x10800000)，而非 Xilinx 官方的 `Xil_DCacheDisable()` 方案。保持 lwIP/TCP 在缓存区域全速运行。
+- **双缓冲无撕裂**: `XDpDma_DisplayGfxFrameBuffer` + `SetupChannel` + `Trigger` 序列实现原子帧切换。
+- **KSZ9031 PHY read-only**: 裸机固件不操作 PHY MDIO，保留 Linux 已配置的千兆链路状态。
+
+### 2. CNN TinyLeNet (Vitis HLS)
+
+```
+输入 28×28 u8 ──▶ Conv1(1→8, 5×5) ──▶ ReLU ──▶ MaxPool2×2
+                  Conv2(8→16, 5×5) ──▶ ReLU ──▶ MaxPool2×2
+                  FC1(256→64) ──▶ ReLU
+                  FC2(64→10) ──▶ Argmax ──▶ 预测类别
+```
+
+**HLS 实现:**
+- 所有层在单个 HLS kernel 中顺序执行
+- 权重在编译时嵌入 (INT8 量化, PyTorch 训练)
+- AXI-Lite 接口: PS 写入 784 字节图像 (4 字节打包), 读回预测 + 10 个分数
+- 资源: 35 BRAM18, 81 DSP48
+
+**训练流程:**
+```bash
+# 在 GPU 服务器上
+python3 train_mnist.py          # PyTorch TinyLeNet, 98.83% test acc
+python3 quantize.py             # FP32 → INT8, 生成 C 头文件
+```
+
+### 3. HOG+SVM 行人检测 (Vitis HLS)
+
+```
+320×240 灰度图 (DDR)
+    │  m_axi DMA burst read
+    ▼
+  Gradient (centered difference, L1 magnitude)
+    ▼
+  Cell Histogram (8×8 cell, 9 orientation bins)
+    ▼
+  Sliding Window (64×128, stride 8px, 495 windows)
+    ▼
+  Linear SVM (3780-dim dot product per window)
+    ▼
+  Detections (x, y, score) × 16 max
+```
+
+**HLS 实现:**
+- `m_axi` 接口从 DDR 读取图像 (76800 字节 burst), `s_axilite` 用于控制和结果
+- PS 把图像放 DDR → 传地址给 HLS → HLS 自己做 DMA 读取
+- SmartConnect 桥接 m_axi 到 PS S_AXI_HP0_FPD 高性能端口
+
+**训练流程:**
+```bash
+# Penn-Fudan Pedestrian Dataset
+python3 train_inria_svm.py      # scikit-learn LinearSVC, 86.4% CV acc
+```
+
+### 4. HLS 图像滤镜 (Burst-Optimized)
+
+```
+帧缓冲 (DDR)
+    │  m_axi burst read (64-word bursts)
+    ▼
+  Row Buffer ──▶ RGB→Gray ──▶ 3-Line Buffer
+                                    │
+                              3×3 Kernel (Sobel/Laplacian/Dilate/Erode)
+                                    │
+                              ──▶ m_axi burst write
+                                    ▼
+                              目标帧缓冲 (DDR)
+```
+
+**Burst 优化:**
+- `max_read_burst_length=64`, `max_write_burst_length=64`
+- `memcpy` 整行 (1280 pixels) 触发 HLS burst 推断
+- `PIPELINE II=1` 所有内循环
+- `ARRAY_PARTITION` line buffer 支持并行 3×3 访问
+- 零拷贝双缓冲: HLS 读 back buffer → 写 front buffer
+
+**性能对比:**
+
+| 滤镜方式 | Sobel FPS | 加速比 |
+|----------|-----------|--------|
+| PS 软件 (ARM A53) | 3.2 fps | 1x |
+| HLS v1 (无 burst) | 13.3 fps | 4.2x |
+| **HLS v2 (burst)** | **18.8 fps** | **5.9x** |
+
+### 5. Vivado Block Design
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Zynq UltraScale+ PS                                       │
+│  ├── M_AXI_HPM0_FPD ──▶ AXI Interconnect                  │
+│  │                       ├── M00 → axi_gpio (0xA0000000)   │
+│  │                       ├── M01 → ped_hls  (0xA0010000)   │
+│  │                       ├── M02 → cnn_hls  (0xA0020000)   │
+│  │                       └── M03 → filter_hls (0xA0030000) │
+│  │                                                          │
+│  └── S_AXI_HP0_FPD ◀── SmartConnect                       │
+│                          ├── S00 ← ped_hls/m_axi_gmem      │
+│                          ├── S01 ← filter_hls/m_axi_gmem0  │
+│                          └── S02 ← filter_hls/m_axi_gmem1  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## 构建指南
+
+### 环境要求
+
+| 工具 | 版本 |
+|------|------|
+| Vivado | 2024.2 |
+| Vitis HLS | 2024.2 |
+| 交叉编译器 | aarch64-none-elf-gcc (Vitis 内置) |
+| Python | 3.x + numpy, pillow |
+| PyTorch | 2.x (训练用, 可选) |
+
+### 1. HLS IP 综合
+
+```bash
+# CNN
+cd cnn/hls
+vitis_hls -f run_cnn_hls.tcl
+
+# 行人检测
+cd ped/hls
+vitis_hls -f run_ped_hls.tcl
+
+# 滤镜
+cd filter/hls
+vitis_hls -f run_filter_hls.tcl
+```
+
+### 2. Vivado Bitstream
+
+```bash
+vivado -mode batch -source integrate_all.tcl
+# 输出: design_1_wrapper.bit
+```
+
+### 3. 固件编译 (Windows)
+
+```powershell
+cd dp
+.\build.ps1
+# 输出: phase2b.elf
+```
+
+### 4. 部署
+
+```bash
+# XSDB 部署
+xsdb boot_phase2b.tcl           # PSU init + ELF download
+xsdb flash_and_reset.tcl        # Hot-swap PL bitstream
+xsdb boot_after_flash.tcl       # Reload firmware after PL flash
+```
+
+### 5. 测试
+
+```bash
+# 视频流
+python3 stream_video.py test_video.mp4 <board_ip>
+
+# CNN 数字识别
+python3 send_digit.py digit_pngs/digit_7_0.png <board_ip>
+
+# 行人检测
+python3 send_ped.py test <board_ip>
+```
+
+## 网络协议
+
+### 端口 5000: 视频流
+
+```
+client → board:  "IMG\0" + width(4) + height(4) + format(4) + W×H×4 bytes RGBA
+board  → 无回复 (直接显示到 DP)
+```
+
+### 端口 5001: CNN 推理
+
+```
+client → board:  "MNI\0" + w(4)=28 + h(4)=28 + fmt(4) + 784 bytes u8 grayscale
+board  → client: "CLS\0" + pred(1) + pad(3) + 10 × float32 probabilities
+```
+
+### 端口 5002: 行人检测
+
+```
+client → board:  "PED\0" + w(4)=320 + h(4)=240 + fmt(4) + 76800 bytes u8 grayscale
+board  → client: "DET\0" + n_dets(4) + n × {pos_word(4) + score_word(4)}
+                  pos_word = (y << 8) | x
+```
+
+## FPGA 资源使用
+
+| IP | LUT | FF | BRAM18 | DSP48 |
+|----|-----|----|--------|-------|
+| CNN TinyLeNet | ~9000 | ~7400 | 35 | 81 |
+| PED HOG+SVM | ~5000 | ~5000 | ~90 | 4 |
+| Filter (burst) | ~3000 | ~3000 | ~5 | 4 |
+| AXI 基础设施 | ~3000 | ~4000 | ~5 | 0 |
+| **总计** | **~20000** | **~19400** | **~135** | **89** |
+| **ZU3EG 容量** | 70,560 | 141,120 | 288 | 360 |
+| **利用率** | **28%** | **14%** | **47%** | **25%** |
+
+## 已知限制与后续改进
+
+1. **PED SVM 权重**: 使用 Penn-Fudan 数据集训练 (86.4% CV), 用 INRIA Person Dataset 可提升到 >95%
+2. **PED 无 NMS**: 重叠检测框原样返回, PS 侧可做简单贪心 NMS
+3. **PED 单尺度**: 仅 64×128 窗口, 多尺度需 PS 缩放图像重复推理
+4. **滤镜 18.8 fps**: 受 DDR 带宽限制 (3.7MB/帧 × 读写), 可通过 AXI-Stream 直接接入 TCP 接收路径优化
+5. **热替换 PL 断网**: 重编程 FPGA 会重置以太网 PHY; 解决方案: 将 bitstream 烧入 QSPI flash
+
+## 许可
+
+本项目仅供学习和研究使用。
