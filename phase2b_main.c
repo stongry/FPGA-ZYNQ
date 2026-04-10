@@ -48,7 +48,22 @@
 #define AP_DONE   (1U << 1)
 #define AP_IDLE   (1U << 2)
 
-static volatile int g_use_pl = 1;  /* 1 = PL accelerator, 0 = PS float32; toggle with 'm' */
+/* Inference engine selector: 0=PS float32, 1=HLS matmul INT8, 2=CNN TinyLeNet */
+static volatile int g_infer_mode = 2;
+static const char *infer_mode_name[] = {"PS (float32)", "PL-HLS (INT8)", "PL-CNN (TinyLeNet)"};
+
+/* ========== CNN TinyLeNet HLS accelerator MMIO ========== */
+/* Register map from Vitis HLS generated driver (xcnn_tinylenet_hls_hw.h) */
+#ifndef CNN_BASE
+#define CNN_BASE        0xA0020000UL  /* Vivado assigned: /cnn_hls/s_axi_ctrl/Reg */
+#endif
+#define CNN_AP_CTRL       (*(volatile uint32_t*)(CNN_BASE + 0x000))
+#define CNN_PRED          (*(volatile uint32_t*)(CNN_BASE + 0x010))
+#define CNN_SCORES(i)     (*(volatile int32_t*)(CNN_BASE + 0x040 + 4*(i)))
+#define CNN_IMAGE_WORD(i) (*(volatile uint32_t*)(CNN_BASE + 0x400 + 4*(i)))
+#define CNN_AP_START  (1U << 0)
+#define CNN_AP_DONE   (1U << 1)
+#define CNN_AP_IDLE   (1U << 2)
 
 static inline uint32_t pack4u(const uint8_t *p) {
     return ((uint32_t)p[0]) | ((uint32_t)p[1] << 8)
@@ -109,6 +124,36 @@ static void mnist_infer_pl(const uint8_t img[784], uint8_t *pred_out,
     for (int k = 1; k < 10; k++)
         if (probs[k] > probs[argmax]) argmax = k;
     *pred_out = (uint8_t)argmax;
+}
+
+static void mnist_infer_cnn(const uint8_t img[784], uint8_t *pred_out,
+                            float probs[10])
+{
+    /* Write 784 bytes packed 4-per-word into HLS image input */
+    for (int i = 0; i < 196; i++) {
+        CNN_IMAGE_WORD(i) = pack4u(&img[i * 4]);
+    }
+
+    /* Trigger inference: write ap_start */
+    CNN_AP_CTRL = CNN_AP_START;
+
+    /* Poll until ap_done */
+    for (volatile int t = 0; t < 10000000; t++)
+        if (CNN_AP_CTRL & CNN_AP_DONE) break;
+
+    /* Read predicted class (HLS argmax result) */
+    *pred_out = (uint8_t)CNN_PRED;
+
+    /* Read raw int32 scores and convert to softmax probabilities */
+    float raw[10];
+    for (int k = 0; k < 10; k++)
+        raw[k] = (float)CNN_SCORES(k);
+
+    float mx = raw[0];
+    for (int k = 1; k < 10; k++) if (raw[k] > mx) mx = raw[k];
+    float sum = 0.0f;
+    for (int k = 0; k < 10; k++) { probs[k] = expf(raw[k] - mx); sum += probs[k]; }
+    for (int k = 0; k < 10; k++) probs[k] /= sum;
 }
 
 /* Display dimensions - referenced by the filter code below */
@@ -412,8 +457,8 @@ static void print_filter_help(void) {
     xil_printf("  e   : erosion 3x3 (post-pass)\r\n");
     xil_printf("  o   : Otsu auto-binarize (post-pass)\r\n");
     xil_printf("  ?   : this help\r\n");
-    xil_printf("  m   : toggle MNIST engine (PL/PS), current=%s\r\n",
-               g_use_pl ? "PL" : "PS");
+    xil_printf("  m   : cycle MNIST engine, current=%s\r\n",
+               infer_mode_name[g_infer_mode]);
 }
 
 static void set_filter(filter_t f) {
@@ -442,8 +487,8 @@ static void handle_uart_cmd(int c) {
     case 'e': case 'E':           set_filter(FLT_ERODE);       break;
     case 'o': case 'O':           set_filter(FLT_OTSU);        break;
     case 'm': case 'M':
-        g_use_pl = !g_use_pl;
-        xil_printf("[cnn] MNIST engine -> %s\r\n", g_use_pl ? "PL (HLS)" : "PS (float32)");
+        g_infer_mode = (g_infer_mode + 1) % 3;
+        xil_printf("[cnn] MNIST engine -> %s\r\n", infer_mode_name[g_infer_mode]);
         break;
     case '?':                     print_filter_help();         break;
     default: break;
@@ -818,10 +863,11 @@ static uint32_t g_mnist_count = 0;
 static void mnist_run_and_reply(struct tcp_pcb *tpcb) {
     uint8_t pred;
     float probs[10];
-    if (g_use_pl)
-        mnist_infer_pl(g_mnist_buf, &pred, probs);
-    else
-        mnist_infer(g_mnist_buf, &pred, probs);
+    switch (g_infer_mode) {
+    case 1:  mnist_infer_pl(g_mnist_buf, &pred, probs);  break;
+    case 2:  mnist_infer_cnn(g_mnist_buf, &pred, probs); break;
+    default: mnist_infer(g_mnist_buf, &pred, probs);     break;
+    }
     g_mnist_count++;
 
     /* format reply: "CLS\0" + pred(1) + pad(3) + 10 * float32 */
@@ -835,7 +881,7 @@ static void mnist_run_and_reply(struct tcp_pcb *tpcb) {
     /* integer percent for UART pretty-print */
     int conf = (int)(probs[pred] * 100.0f + 0.5f);
     xil_printf("[%s] #%d -> digit %d  (conf %d%%)\r\n",
-               g_use_pl ? "PL" : "PS",
+               infer_mode_name[g_infer_mode],
                g_mnist_count, pred, conf);
 }
 
