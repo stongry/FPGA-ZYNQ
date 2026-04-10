@@ -1,15 +1,14 @@
-// Video Filter HLS Accelerator for FZ3A
-// Reads 1280x720 RGBA frame from DDR, applies filter, writes back
-// Filters: 0=pass, 1=gray, 2=negative, 3=Sobel, 4=Laplacian, 5=dilate, 6=erode
-// Uses m_axi for DDR access, s_axilite for control
+// Video Filter HLS Accelerator v2 - Burst-optimized
+// Key optimizations:
+//   1. Burst read entire rows (1280 pixels) for better DDR bandwidth
+//   2. Pipeline inner pixel loop II=1
+//   3. Line buffer partitioned for parallel access
 #include <stdint.h>
 #include <string.h>
 
 #define FB_W    1280
 #define FB_H    720
-#define FB_SIZE (FB_W * FB_H)  // pixels (each 4 bytes RGBA)
 
-// Filter IDs matching firmware
 #define FLT_NONE      0
 #define FLT_GRAY      1
 #define FLT_NEGATIVE  2
@@ -22,81 +21,92 @@ static inline uint8_t sat8(int v) {
     return v < 0 ? 0 : (v > 255 ? 255 : (uint8_t)v);
 }
 
-static inline uint8_t rgb2y(uint8_t r, uint8_t g, uint8_t b) {
-    return (uint8_t)(((uint32_t)r * 76 + (uint32_t)g * 150 + (uint32_t)b * 29) >> 8);
-}
-
 extern "C" void filter_hls(
-    uint32_t *src,       // m_axi: source RGBA frame in DDR
-    uint32_t *dst,       // m_axi: destination RGBA frame in DDR
-    int32_t   filter_id  // s_axilite: filter type
+    uint32_t *src,
+    uint32_t *dst,
+    int32_t   filter_id
 ) {
-#pragma HLS INTERFACE m_axi port=src offset=slave bundle=gmem0 depth=921600
-#pragma HLS INTERFACE m_axi port=dst offset=slave bundle=gmem1 depth=921600
+#pragma HLS INTERFACE m_axi port=src offset=slave bundle=gmem0 depth=921600 max_read_burst_length=64
+#pragma HLS INTERFACE m_axi port=dst offset=slave bundle=gmem1 depth=921600 max_write_burst_length=64
 #pragma HLS INTERFACE s_axilite port=src bundle=ctrl
 #pragma HLS INTERFACE s_axilite port=dst bundle=ctrl
 #pragma HLS INTERFACE s_axilite port=filter_id bundle=ctrl
 #pragma HLS INTERFACE s_axilite port=return bundle=ctrl
 
-    // Line buffers for 3x3 kernels (3 rows of grayscale)
+    if (filter_id == FLT_NONE) {
+        memcpy(dst, src, FB_W * FB_H * 4);
+        return;
+    }
+
+    // Row buffers for burst read
+    uint32_t row_buf[FB_W];
+#pragma HLS BIND_STORAGE variable=row_buf type=ram_1p
+
+    if (filter_id == FLT_GRAY || filter_id == FLT_NEGATIVE) {
+        // Simple per-pixel: burst read row, process, burst write
+        SIMPLE_Y: for (int y = 0; y < FB_H; y++) {
+            // Burst read
+            memcpy(row_buf, &src[y * FB_W], FB_W * 4);
+            // Process
+            SIMPLE_X: for (int x = 0; x < FB_W; x++) {
+#pragma HLS PIPELINE II=1
+                uint32_t px = row_buf[x];
+                if (filter_id == FLT_GRAY) {
+                    uint8_t r = px & 0xFF, g = (px >> 8) & 0xFF, b = (px >> 16) & 0xFF;
+                    uint8_t Y = (uint8_t)(((uint32_t)r * 76 + (uint32_t)g * 150 + (uint32_t)b * 29) >> 8);
+                    row_buf[x] = Y | (Y << 8) | (Y << 16) | (px & 0xFF000000);
+                } else {
+                    row_buf[x] = (px ^ 0x00FFFFFF) | (px & 0xFF000000);
+                }
+            }
+            // Burst write
+            memcpy(&dst[y * FB_W], row_buf, FB_W * 4);
+        }
+        return;
+    }
+
+    // 3x3 kernel filters with line buffers
     uint8_t line[3][FB_W];
 #pragma HLS ARRAY_PARTITION variable=line dim=1 complete
 
-    if (filter_id == FLT_NONE) {
-        // Passthrough: burst copy
-        memcpy(dst, src, FB_SIZE * 4);
-        return;
-    }
+    uint32_t out_row[FB_W];
 
-    if (filter_id == FLT_GRAY) {
-        GRAY_Y: for (int y = 0; y < FB_H; y++) {
-            GRAY_X: for (int x = 0; x < FB_W; x++) {
-                uint32_t px = src[y * FB_W + x];
-                uint8_t r = px & 0xFF, g = (px >> 8) & 0xFF, b = (px >> 16) & 0xFF, a = (px >> 24) & 0xFF;
-                uint8_t Y = rgb2y(r, g, b);
-                dst[y * FB_W + x] = Y | (Y << 8) | (Y << 16) | ((uint32_t)a << 24);
-            }
-        }
-        return;
+    // Preload row 0 and 1
+    memcpy(row_buf, &src[0], FB_W * 4);
+    INIT0: for (int x = 0; x < FB_W; x++) {
+#pragma HLS PIPELINE II=1
+        uint32_t px = row_buf[x];
+        line[0][x] = (uint8_t)(((px & 0xFF) * 76 + ((px >> 8) & 0xFF) * 150 + ((px >> 16) & 0xFF) * 29) >> 8);
     }
-
-    if (filter_id == FLT_NEGATIVE) {
-        NEG_Y: for (int y = 0; y < FB_H; y++) {
-            NEG_X: for (int x = 0; x < FB_W; x++) {
-                uint32_t px = src[y * FB_W + x];
-                uint8_t a = (px >> 24) & 0xFF;
-                dst[y * FB_W + x] = (px ^ 0x00FFFFFF) | ((uint32_t)a << 24);
-            }
-        }
-        return;
-    }
-
-    // 3x3 kernel filters: load grayscale line buffers
-    // Preload first two rows
-    for (int x = 0; x < FB_W; x++) {
-        uint32_t px0 = src[x];
-        line[0][x] = rgb2y(px0 & 0xFF, (px0 >> 8) & 0xFF, (px0 >> 16) & 0xFF);
-        uint32_t px1 = src[FB_W + x];
-        line[1][x] = rgb2y(px1 & 0xFF, (px1 >> 8) & 0xFF, (px1 >> 16) & 0xFF);
+    memcpy(row_buf, &src[FB_W], FB_W * 4);
+    INIT1: for (int x = 0; x < FB_W; x++) {
+#pragma HLS PIPELINE II=1
+        uint32_t px = row_buf[x];
+        line[1][x] = (uint8_t)(((px & 0xFF) * 76 + ((px >> 8) & 0xFF) * 150 + ((px >> 16) & 0xFF) * 29) >> 8);
     }
     // Copy first row as-is
-    for (int x = 0; x < FB_W; x++) dst[x] = src[x];
+    memcpy(out_row, &src[0], FB_W * 4);
+    memcpy(&dst[0], out_row, FB_W * 4);
 
     KERN_Y: for (int y = 1; y < FB_H - 1; y++) {
         int r0 = (y - 1) % 3, r1 = y % 3, r2 = (y + 1) % 3;
-        // Load next row
-        for (int x = 0; x < FB_W; x++) {
-            uint32_t px = src[(y + 1) * FB_W + x];
-            line[r2][x] = rgb2y(px & 0xFF, (px >> 8) & 0xFF, (px >> 16) & 0xFF);
+
+        // Burst read next row + convert to gray
+        memcpy(row_buf, &src[(y + 1) * FB_W], FB_W * 4);
+        LOAD: for (int x = 0; x < FB_W; x++) {
+#pragma HLS PIPELINE II=1
+            uint32_t px = row_buf[x];
+            line[r2][x] = (uint8_t)(((px & 0xFF) * 76 + ((px >> 8) & 0xFF) * 150 + ((px >> 16) & 0xFF) * 29) >> 8);
         }
 
-        // Copy border pixels
-        dst[y * FB_W] = src[y * FB_W];
-        dst[y * FB_W + FB_W - 1] = src[y * FB_W + FB_W - 1];
+        // Border pixels
+        out_row[0] = src[y * FB_W];
+        out_row[FB_W - 1] = src[y * FB_W + FB_W - 1];
 
+        // 3x3 kernel
         KERN_X: for (int x = 1; x < FB_W - 1; x++) {
-            uint8_t v = 0;
-
+#pragma HLS PIPELINE II=1
+            uint8_t v;
             if (filter_id == FLT_SOBEL) {
                 int gx = -(int)line[r0][x-1] - 2*(int)line[r1][x-1] - (int)line[r2][x-1]
                         +(int)line[r0][x+1] + 2*(int)line[r1][x+1] + (int)line[r2][x+1];
@@ -117,7 +127,7 @@ extern "C" void filter_hls(
                         if (val > mx) mx = val;
                     }
                 v = mx;
-            } else if (filter_id == FLT_ERODE) {
+            } else { // ERODE
                 uint8_t mn = 255;
                 for (int dy = -1; dy <= 1; dy++)
                     for (int dx = -1; dx <= 1; dx++) {
@@ -126,10 +136,14 @@ extern "C" void filter_hls(
                     }
                 v = mn;
             }
-
-            dst[y * FB_W + x] = v | (v << 8) | (v << 16) | 0xFF000000;
+            out_row[x] = v | (v << 8) | (v << 16) | 0xFF000000;
         }
+
+        // Burst write processed row
+        memcpy(&dst[y * FB_W], out_row, FB_W * 4);
     }
+
     // Copy last row
-    for (int x = 0; x < FB_W; x++) dst[(FB_H-1) * FB_W + x] = src[(FB_H-1) * FB_W + x];
+    memcpy(row_buf, &src[(FB_H-1) * FB_W], FB_W * 4);
+    memcpy(&dst[(FB_H-1) * FB_W], row_buf, FB_W * 4);
 }

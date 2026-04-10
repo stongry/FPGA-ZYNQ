@@ -180,7 +180,7 @@ static void mnist_infer_cnn(const uint8_t img[784], uint8_t *pred_out,
 #define FLT_SRC_BUF   ((uint8_t *)FLT_SRC_ADDR)
 
 /* Set to 1 when PL bitstream with filter HLS IP is loaded */
-static volatile int g_flt_hls_available = 0;
+static volatile int g_flt_hls_available = 1;  /* enable when HLS bitstream loaded */
 
 /* Display dimensions - referenced by the filter code below */
 #define FB_W   1280
