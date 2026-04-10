@@ -973,16 +973,21 @@ static void start_mnist_server(void) {
 #define PED_MAX_DETS 16
 
 #ifndef PED_BASE
-#define PED_BASE       0xA0030000UL  /* Vivado assigned: /ped_hls/s_axi_ctrl/Reg */
+#define PED_BASE       0xA0010000UL  /* Vivado: /ped_hls/s_axi_ctrl */
 #endif
-#define PED_AP_CTRL       (*(volatile uint32_t*)(PED_BASE + 0x00000))
-#define PED_NUM_DETS      (*(volatile uint32_t*)(PED_BASE + 0x00010))
-#define PED_THRESHOLD     (*(volatile uint32_t*)(PED_BASE + 0x00020))
-#define PED_DET(i)        (*(volatile int32_t*)(PED_BASE + 0x00080 + 4*(i)))
-#define PED_IMAGE_WORD(i) (*(volatile uint32_t*)(PED_BASE + 0x20000 + 4*(i)))
+#define PED_AP_CTRL       (*(volatile uint32_t*)(PED_BASE + 0x00))
+#define PED_IMAGE_ADDR_LO (*(volatile uint32_t*)(PED_BASE + 0x10))
+#define PED_IMAGE_ADDR_HI (*(volatile uint32_t*)(PED_BASE + 0x14))
+#define PED_NUM_DETS      (*(volatile uint32_t*)(PED_BASE + 0x1C))
+#define PED_THRESHOLD     (*(volatile uint32_t*)(PED_BASE + 0x2C))
+#define PED_DET(i)        (*(volatile int32_t*)(PED_BASE + 0x80 + 4*(i)))
 #define PED_AP_START (1U << 0)
 #define PED_AP_DONE  (1U << 1)
 #define PED_AP_IDLE  (1U << 2)
+
+/* DDR buffer for PED image - use address after framebuffers (0x10800000+) */
+#define PED_DDR_BUF_ADDR  0x10800000UL
+#define PED_DDR_BUF       ((uint8_t *)PED_DDR_BUF_ADDR)
 
 /* PED TCP state machine (port 5002)
  * Protocol:
@@ -999,13 +1004,14 @@ static uint32_t g_ped_got = 0;
 static uint32_t g_ped_count = 0;
 
 static void ped_run_and_reply(struct tcp_pcb *tpcb) {
-    /* Test: write just 1 word to PED control area, then try image area */
-    PED_THRESHOLD = 100;  /* write to offset 0x20, should be safe */
-    /* Now try writing first image word at offset 0x20000 */
-    PED_IMAGE_WORD(0) = pack4u(&g_ped_buf[0]);
-    /* Write image packed 4 bytes per word */
-    for (int i = 0; i < PED_IMG_SIZE / 4; i++)
-        PED_IMAGE_WORD(i) = pack4u(&g_ped_buf[i * 4]);
+    /* Copy image to DDR buffer and flush cache so PL DMA sees it */
+    memcpy(PED_DDR_BUF, g_ped_buf, PED_IMG_SIZE);
+    Xil_DCacheFlushRange((INTPTR)PED_DDR_BUF, PED_IMG_SIZE);
+
+    /* Pass DDR physical address to HLS via s_axilite */
+    uintptr_t addr = (uintptr_t)PED_DDR_BUF;
+    PED_IMAGE_ADDR_LO = (uint32_t)(addr & 0xFFFFFFFF);
+    PED_IMAGE_ADDR_HI = (uint32_t)(addr >> 32);
 
     /* Set threshold and trigger */
     PED_THRESHOLD = 0;
@@ -1123,7 +1129,8 @@ int main(void) {
      *     bypass cache and land in DDR directly.
      */
     Xil_DCacheFlush();
-    for (uint64_t a = 0x10000000ULL; a < 0x10800000ULL; a += 0x200000ULL) {
+    /* 0x10000000..0x10800000 = framebuffers, 0x10800000..0x10A00000 = PED DDR buf */
+    for (uint64_t a = 0x10000000ULL; a < 0x10A00000ULL; a += 0x200000ULL) {
         Xil_SetTlbAttributes(a, NORM_NONCACHE);
     }
     __asm__ volatile("dsb sy; isb" ::: "memory");
