@@ -179,6 +179,9 @@ static void mnist_infer_cnn(const uint8_t img[784], uint8_t *pred_out,
 #define FLT_SRC_ADDR  0x10A00000UL
 #define FLT_SRC_BUF   ((uint8_t *)FLT_SRC_ADDR)
 
+/* Set to 1 when PL bitstream with filter HLS IP is loaded */
+static volatile int g_flt_hls_available = 0;
+
 /* Display dimensions - referenced by the filter code below */
 #define FB_W   1280
 #define FB_H   720
@@ -808,8 +811,9 @@ static err_t img_recv_cb(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t 
                      * HLS filter writes to the OTHER buffer (zero-copy). */
                     int disp_buf = g_back;
                     filter_t cur_f = g_filter;
-                    if (cur_f == FLT_SOBEL || cur_f == FLT_LAPLACIAN ||
-                        cur_f == FLT_DILATE || cur_f == FLT_ERODE) {
+                    if ((cur_f == FLT_SOBEL || cur_f == FLT_LAPLACIAN ||
+                         cur_f == FLT_DILATE || cur_f == FLT_ERODE) &&
+                        g_flt_hls_available) {
                         apply_post_pass_hls(cur_f, Frames[g_back], Frames[1 - g_back]);
                         disp_buf = 1 - g_back;
                     } else {
