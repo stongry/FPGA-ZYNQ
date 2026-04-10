@@ -156,6 +156,29 @@ static void mnist_infer_cnn(const uint8_t img[784], uint8_t *pred_out,
     for (int k = 0; k < 10; k++) probs[k] /= sum;
 }
 
+/* ========== Video Filter HLS accelerator MMIO ========== */
+#ifndef FLT_HLS_BASE
+#define FLT_HLS_BASE     0xA0030000UL  /* Vivado: /filter_hls/s_axi_ctrl */
+#endif
+#define FLT_AP_CTRL       (*(volatile uint32_t*)(FLT_HLS_BASE + 0x00))
+#define FLT_SRC_LO        (*(volatile uint32_t*)(FLT_HLS_BASE + 0x10))
+#define FLT_SRC_HI        (*(volatile uint32_t*)(FLT_HLS_BASE + 0x14))
+#define FLT_DST_LO        (*(volatile uint32_t*)(FLT_HLS_BASE + 0x1C))
+#define FLT_DST_HI        (*(volatile uint32_t*)(FLT_HLS_BASE + 0x20))
+#define FLT_FILTER_ID     (*(volatile uint32_t*)(FLT_HLS_BASE + 0x28))
+#define FLT_AP_START  (1U << 0)
+#define FLT_AP_DONE   (1U << 1)
+#define FLT_AP_IDLE   (1U << 2)
+#define HLS_FLT_NONE      0
+#define HLS_FLT_GRAY      1
+#define HLS_FLT_NEGATIVE  2
+#define HLS_FLT_SOBEL     3
+#define HLS_FLT_LAPLACIAN 4
+#define HLS_FLT_DILATE    5
+#define HLS_FLT_ERODE     6
+#define FLT_SRC_ADDR  0x10A00000UL
+#define FLT_SRC_BUF   ((uint8_t *)FLT_SRC_ADDR)
+
 /* Display dimensions - referenced by the filter code below */
 #define FB_W   1280
 #define FB_H   720
@@ -428,6 +451,29 @@ static void apply_otsu(uint8_t *fb) {
 }
 
 /* Dispatch post-pass filters on completed back frame. */
+static void apply_post_pass_hls(filter_t f, uint8_t *src_fb, uint8_t *dst_fb) {
+    int hls_id = -1;
+    switch (f) {
+    case FLT_SOBEL:     hls_id = HLS_FLT_SOBEL;     break;
+    case FLT_LAPLACIAN: hls_id = HLS_FLT_LAPLACIAN; break;
+    case FLT_DILATE:    hls_id = HLS_FLT_DILATE;    break;
+    case FLT_ERODE:     hls_id = HLS_FLT_ERODE;     break;
+    default: return;
+    }
+    uintptr_t sa = (uintptr_t)src_fb;
+    uintptr_t da = (uintptr_t)dst_fb;
+    FLT_SRC_LO = (uint32_t)(sa & 0xFFFFFFFF);
+    FLT_SRC_HI = (uint32_t)(sa >> 32);
+    FLT_DST_LO = (uint32_t)(da & 0xFFFFFFFF);
+    FLT_DST_HI = (uint32_t)(da >> 32);
+    FLT_FILTER_ID = hls_id;
+    FLT_AP_CTRL = FLT_AP_START;
+
+    /* Poll done */
+    for (volatile int t = 0; t < 50000000; t++)
+        if (FLT_AP_CTRL & FLT_AP_DONE) break;
+}
+
 static void apply_post_pass(filter_t f, uint8_t *fb) {
     switch (f) {
     case FLT_SOBEL:     apply_sobel(fb);     break;
@@ -758,10 +804,19 @@ static err_t img_recv_cb(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t 
                 bytes += take; remain -= take;
                 if (g_got == g_expect) {
                     g_frames_received++;
-                    /* Run post-pass kernel filter (Sobel/Laplacian/...). */
-                    apply_post_pass(g_filter, Frames[g_back]);
-                    /* Swap DPDMA to the newly-filled buffer. */
-                    XDpDma_DisplayGfxFrameBuffer(RunCfg.DpDmaPtr, &FrameBuffers[g_back]);
+                    /* Run post-pass kernel filter (Sobel/Laplacian/...).
+                     * HLS filter writes to the OTHER buffer (zero-copy). */
+                    int disp_buf = g_back;
+                    filter_t cur_f = g_filter;
+                    if (cur_f == FLT_SOBEL || cur_f == FLT_LAPLACIAN ||
+                        cur_f == FLT_DILATE || cur_f == FLT_ERODE) {
+                        apply_post_pass_hls(cur_f, Frames[g_back], Frames[1 - g_back]);
+                        disp_buf = 1 - g_back;
+                    } else {
+                        apply_post_pass(cur_f, Frames[g_back]);
+                    }
+                    /* Swap DPDMA to the output buffer. */
+                    XDpDma_DisplayGfxFrameBuffer(RunCfg.DpDmaPtr, &FrameBuffers[disp_buf]);
                     XDpDma_SetupChannel(RunCfg.DpDmaPtr, GraphicsChan);
                     XDpDma_Trigger(RunCfg.DpDmaPtr, GraphicsChan);
                     g_front = g_back;
@@ -1129,8 +1184,10 @@ int main(void) {
      *     bypass cache and land in DDR directly.
      */
     Xil_DCacheFlush();
-    /* 0x10000000..0x10800000 = framebuffers, 0x10800000..0x10A00000 = PED DDR buf */
-    for (uint64_t a = 0x10000000ULL; a < 0x10A00000ULL; a += 0x200000ULL) {
+    /* 0x10000000..0x10800000 = framebuffers
+     * 0x10800000..0x10A00000 = PED DDR buf
+     * 0x10A00000..0x11400000 = FLT src buf (3.7MB) */
+    for (uint64_t a = 0x10000000ULL; a < 0x11400000ULL; a += 0x200000ULL) {
         Xil_SetTlbAttributes(a, NORM_NONCACHE);
     }
     __asm__ volatile("dsb sy; isb" ::: "memory");
