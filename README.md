@@ -4,23 +4,48 @@
 
 ## 系统架构
 
-```
-                          ┌─────────────────────────────────────────────┐
-                          │              FPGA PL (可编程逻辑)             │
-  PC/Camera ──TCP 5000──▶ │  ┌─────────────────────────────────────┐   │
-  1280×720 RGBA @ 30fps   │  │  Video Filter HLS (Sobel/Lap/...)  │   │──▶ DisplayPort
-                          │  │  m_axi DMA, burst-optimized        │   │    1280×720@60Hz
-  PC ────────TCP 5001──▶ │  ├─────────────────────────────────────┤   │
-  28×28 digit image       │  │  CNN TinyLeNet HLS                 │   │
-                          │  │  Conv→Pool→Conv→Pool→FC→FC→Argmax  │   │
-  PC ────────TCP 5002──▶ │  ├─────────────────────────────────────┤   │
-  320×240 grayscale       │  │  PED HOG+SVM HLS                   │   │
-                          │  │  Gradient→HOG→SlidingWindow→SVM    │   │
-                          │  └─────────────────────────────────────┘   │
-                          ├─────────────────────────────────────────────┤
-                          │              PS (ARM Cortex-A53)            │
-                          │  lwIP TCP/IP ─ DPDMA ─ GIC ─ UART         │
-                          └─────────────────────────────────────────────┘
+```mermaid
+graph LR
+    subgraph 外部设备
+        PC1["PC/Camera<br/>视频流"]
+        PC2["PC<br/>数字图片"]
+        PC3["PC<br/>灰度图"]
+        MON["DisplayPort<br/>显示器"]
+    end
+
+    subgraph PS ["ARM Cortex-A53 (PS)"]
+        TCP0["TCP:5000<br/>视频接收"]
+        TCP1["TCP:5001<br/>CNN 请求"]
+        TCP2["TCP:5002<br/>PED 请求"]
+        DPDMA["DPDMA<br/>显示引擎"]
+        DDR["DDR4 2GB<br/>帧缓冲"]
+    end
+
+    subgraph PL ["FPGA 可编程逻辑 (PL)"]
+        FLT["Filter HLS<br/>Sobel/Laplacian<br/>18.8fps 5.9x加速"]
+        CNN["CNN HLS<br/>TinyLeNet<br/>3.7ms 100%"]
+        PED["PED HLS<br/>HOG+SVM<br/>21.6ms 46FPS"]
+    end
+
+    PC1 -->|"千兆TCP<br/>108MB/s"| TCP0
+    PC2 -->|"TCP:5001<br/>784 bytes"| TCP1
+    PC3 -->|"TCP:5002<br/>76.8KB"| TCP2
+
+    TCP0 --> DDR
+    DDR -->|"m_axi DMA"| FLT
+    FLT -->|"m_axi DMA"| DDR
+    DDR --> DPDMA
+    DPDMA --> MON
+
+    TCP1 -->|"AXI-Lite"| CNN
+    CNN -->|"pred+scores"| TCP1
+
+    TCP2 --> DDR
+    DDR -->|"m_axi DMA"| PED
+    PED -->|"detections"| TCP2
+
+    style PL fill:#e1f5fe,stroke:#0277bd
+    style PS fill:#fff3e0,stroke:#ef6c00
 ```
 
 ## 性能指标
@@ -176,11 +201,121 @@ PC (ffmpeg/Python) ──TCP 5000──▶ lwIP TCP 接收 ──▶ 帧缓冲 (
 
 ### 2. CNN TinyLeNet (Vitis HLS)
 
+#### CNN 网络结构详图
+
+```mermaid
+graph TD
+    INPUT["输入图像<br/>28 x 28 x 1<br/>uint8 (784 bytes)"]
+
+    subgraph CONV1_BLOCK ["Conv1 Block"]
+        CONV1["Conv2D<br/>kernel: 5x5, stride: 1<br/>in: 1ch, out: 8ch<br/>weights: 200 int8<br/>bias: 8 int32"]
+        RELU1["ReLU<br/>max(0, x)"]
+        POOL1["MaxPool 2x2<br/>stride: 2"]
+    end
+
+    subgraph CONV2_BLOCK ["Conv2 Block"]
+        CONV2["Conv2D<br/>kernel: 5x5, stride: 1<br/>in: 8ch, out: 16ch<br/>weights: 3200 int8<br/>bias: 16 int32"]
+        RELU2["ReLU<br/>max(0, x)"]
+        POOL2["MaxPool 2x2<br/>stride: 2"]
+    end
+
+    FLAT["Flatten<br/>16 x 4 x 4 = 256"]
+
+    subgraph FC_BLOCK ["Fully Connected"]
+        FC1["FC1: 256 → 64<br/>weights: 16384 int8<br/>bias: 64 int32"]
+        RELU3["ReLU"]
+        FC2["FC2: 64 → 10<br/>weights: 640 int8<br/>bias: 10 int32"]
+    end
+
+    ARGMAX["Argmax<br/>→ 预测类别 0-9"]
+    OUTPUT["输出<br/>pred: uint8<br/>scores: 10 x int32"]
+
+    INPUT -->|"28x28x1"| CONV1
+    CONV1 -->|"24x24x8"| RELU1
+    RELU1 -->|"24x24x8"| POOL1
+    POOL1 -->|"12x12x8"| CONV2
+    CONV2 -->|"8x8x16"| RELU2
+    RELU2 -->|"8x8x16"| POOL2
+    POOL2 -->|"4x4x16"| FLAT
+    FLAT -->|"256"| FC1
+    FC1 -->|"64"| RELU3
+    RELU3 -->|"64"| FC2
+    FC2 -->|"10"| ARGMAX
+    ARGMAX --> OUTPUT
+
+    style INPUT fill:#c8e6c9,stroke:#2e7d32
+    style OUTPUT fill:#ffcdd2,stroke:#c62828
+    style CONV1_BLOCK fill:#e3f2fd,stroke:#1565c0
+    style CONV2_BLOCK fill:#e3f2fd,stroke:#1565c0
+    style FC_BLOCK fill:#fce4ec,stroke:#ad1457
 ```
-输入 28×28 u8 ──▶ Conv1(1→8, 5×5) ──▶ ReLU ──▶ MaxPool2×2
-                  Conv2(8→16, 5×5) ──▶ ReLU ──▶ MaxPool2×2
-                  FC1(256→64) ──▶ ReLU
-                  FC2(64→10) ──▶ Argmax ──▶ 预测类别
+
+#### CNN 数据流维度变化
+
+```mermaid
+graph LR
+    A["28x28x1<br/>784 B"] -->|"Conv 5x5<br/>pad=0"| B["24x24x8<br/>4608"]
+    B -->|"Pool 2x2"| C["12x12x8<br/>1152"]
+    C -->|"Conv 5x5<br/>8→16ch"| D["8x8x16<br/>1024"]
+    D -->|"Pool 2x2"| E["4x4x16<br/>256"]
+    E -->|"FC"| F["64"]
+    F -->|"FC"| G["10"]
+    G -->|"argmax"| H["class"]
+
+    style A fill:#a5d6a7
+    style H fill:#ef9a9a
+```
+
+#### CNN 量化与 HLS 实现流程
+
+```mermaid
+flowchart TD
+    subgraph TRAINING ["训练阶段 (GPU 服务器)"]
+        T1["PyTorch TinyLeNet<br/>FP32 训练"] --> T2["MNIST 60K 训练集<br/>5 epochs"]
+        T2 --> T3["测试集准确率<br/>98.83%"]
+        T3 --> T4["INT8 对称量化<br/>per-layer scale"]
+        T4 --> T5["导出 C 头文件<br/>cnn_hls_weights.h"]
+    end
+
+    subgraph HLS ["HLS 综合 (Vitis HLS)"]
+        H1["C++ Kernel<br/>cnn_hls_kernel.cpp"] --> H2["权重嵌入<br/>const int8 数组"]
+        H2 --> H3["csynth_design<br/>→ Verilog RTL"]
+        H3 --> H4["export_design<br/>→ Vivado IP"]
+    end
+
+    subgraph VIVADO ["Vivado 集成"]
+        V1["添加 IP 到<br/>Block Design"] --> V2["AXI-Lite 连接<br/>HPM0_FPD"]
+        V2 --> V3["地址分配<br/>0xA0020000"]
+        V3 --> V4["综合+布局布线<br/>→ Bitstream"]
+    end
+
+    subgraph RUNTIME ["运行时 (FPGA)"]
+        R1["PS 写入 784 bytes<br/>AXI-Lite 4字节打包"] --> R2["ap_start 触发"]
+        R2 --> R3["PL 执行 6 层推理<br/>3.7ms @ 100MHz"]
+        R3 --> R4["PS 读取 pred + scores"]
+    end
+
+    T5 --> H1
+    H4 --> V1
+    V4 --> R1
+
+    style TRAINING fill:#e8f5e9
+    style HLS fill:#e3f2fd
+    style VIVADO fill:#fff3e0
+    style RUNTIME fill:#fce4ec
+```
+
+#### CNN HLS 资源使用
+
+```mermaid
+pie title FPGA 资源占用 (ZU3EG)
+    "CNN LUT (12%)" : 9000
+    "CNN BRAM (12%)" : 35
+    "CNN DSP (22%)" : 81
+    "PED LUT+BRAM" : 5000
+    "Filter LUT" : 3000
+    "AXI 基础设施" : 3000
+    "剩余可用" : 50560
 ```
 
 **HLS 实现:**
@@ -198,19 +333,95 @@ python3 quantize.py             # FP32 → INT8, 生成 C 头文件
 
 ### 3. HOG+SVM 行人检测 (Vitis HLS)
 
+#### 行人检测处理流水线
+
+```mermaid
+flowchart TD
+    IMG["320x240 灰度图<br/>76,800 bytes (DDR)"]
+    
+    subgraph DMA ["m_axi DMA 读取"]
+        D1["Burst Read<br/>PS → DDR → PL<br/>via HP0 端口"]
+    end
+
+    subgraph GRAD ["梯度计算"]
+        G1["Centered Difference<br/>Gx = I(x+1) - I(x-1)<br/>Gy = I(y+1) - I(y-1)"]
+        G2["L1 幅值<br/>mag = |Gx| + |Gy|"]
+        G3["方向量化<br/>5 sector → 9 bins<br/>(无 atan2, 纯比较)"]
+    end
+
+    subgraph HOG ["HOG 直方图"]
+        H1["Cell 累加<br/>8x8 pixel → 1 cell<br/>40x30 = 1200 cells"]
+        H2["9 orientation bins<br/>per cell<br/>加权: mag 累加"]
+    end
+
+    subgraph SVM_SCAN ["滑窗 SVM 扫描"]
+        S0["检测窗口: 64x128<br/>= 8x16 cells"]
+        S1["滑窗步长: 8px<br/>33 x 15 = 495 windows"]
+        S2["Block: 2x2 cells<br/>7x15 = 105 blocks/window"]
+        S3["特征维度<br/>105 x 4 x 9 = 3780"]
+        S4["SVM 点积<br/>Σ(w_i × feat_i) + bias<br/>3780 次 MAC/window"]
+    end
+
+    subgraph OUT ["输出"]
+        O1["阈值判决<br/>score > threshold"]
+        O2["检测结果<br/>max 16 个<br/>(x, y, score)"]
+    end
+
+    IMG --> D1
+    D1 --> G1
+    G1 --> G2
+    G2 --> G3
+    G3 --> H1
+    H1 --> H2
+    H2 --> S0
+    S0 --> S1
+    S1 --> S2
+    S2 --> S3
+    S3 --> S4
+    S4 --> O1
+    O1 --> O2
+
+    style DMA fill:#e0f7fa,stroke:#00838f
+    style GRAD fill:#f3e5f5,stroke:#6a1b9a
+    style HOG fill:#e8f5e9,stroke:#2e7d32
+    style SVM_SCAN fill:#fff3e0,stroke:#e65100
+    style OUT fill:#ffcdd2,stroke:#b71c1c
 ```
-320×240 灰度图 (DDR)
-    │  m_axi DMA burst read
-    ▼
-  Gradient (centered difference, L1 magnitude)
-    ▼
-  Cell Histogram (8×8 cell, 9 orientation bins)
-    ▼
-  Sliding Window (64×128, stride 8px, 495 windows)
-    ▼
-  Linear SVM (3780-dim dot product per window)
-    ▼
-  Detections (x, y, score) × 16 max
+
+#### 行人检测 AXI 数据通路
+
+```mermaid
+graph LR
+    subgraph PS_SIDE ["PS (ARM A53)"]
+        A1["TCP:5002<br/>接收 76.8KB"]
+        A2["memcpy → DDR<br/>0x10800000"]
+        A3["写入 PED 地址寄存器<br/>AXI-Lite @ 0xA0010000"]
+        A4["读取结果<br/>n_dets + boxes"]
+    end
+
+    subgraph PL_SIDE ["PL (HLS)"]
+        B1["s_axi_ctrl<br/>控制寄存器"]
+        B2["m_axi_gmem<br/>DMA Master"]
+        B3["HOG+SVM<br/>计算引擎"]
+    end
+
+    subgraph DDR_MEM ["DDR4"]
+        C1["Image Buffer<br/>0x10800000<br/>76.8KB"]
+    end
+
+    A1 --> A2
+    A2 --> C1
+    A3 -->|"addr + start"| B1
+    B1 --> B3
+    B2 -->|"Burst Read"| C1
+    C1 -->|"pixel data"| B2
+    B2 --> B3
+    B3 -->|"detections"| B1
+    B1 -->|"results"| A4
+
+    style PS_SIDE fill:#fff3e0
+    style PL_SIDE fill:#e3f2fd
+    style DDR_MEM fill:#e8eaf6
 ```
 
 **HLS 实现:**
@@ -226,17 +437,54 @@ python3 train_inria_svm.py      # scikit-learn LinearSVC, 86.4% CV acc
 
 ### 4. HLS 图像滤镜 (Burst-Optimized)
 
+#### 滤镜 HLS 处理流水线
+
+```mermaid
+flowchart TD
+    subgraph INPUT ["输入 (DDR)"]
+        SRC["源帧缓冲<br/>1280x720 RGBA<br/>3.69 MB"]
+    end
+
+    subgraph BURST_RD ["m_axi Burst Read"]
+        BR["整行读取<br/>1280 pixels/burst<br/>max_burst=64 words"]
+    end
+
+    subgraph PROCESS ["行级处理流水线"]
+        RGB["RGB → Gray<br/>Y = R*76+G*150+B*29 >> 8<br/>PIPELINE II=1"]
+        LB["3-Line Buffer<br/>line[3][1280]<br/>ARRAY_PARTITION dim=1"]
+        K33["3x3 Kernel<br/>可选: Sobel/Laplacian<br/>Dilate/Erode<br/>PIPELINE II=1"]
+    end
+
+    subgraph BURST_WR ["m_axi Burst Write"]
+        BW["整行写出<br/>1280 pixels/burst"]
+    end
+
+    subgraph OUTPUT ["输出 (DDR)"]
+        DST["目标帧缓冲<br/>(另一个双缓冲)"]
+    end
+
+    SRC --> BR
+    BR --> RGB
+    RGB -->|"gray row"| LB
+    LB -->|"row[y-1]<br/>row[y]<br/>row[y+1]"| K33
+    K33 -->|"filtered row"| BW
+    BW --> DST
+
+    style INPUT fill:#e8f5e9
+    style BURST_RD fill:#e0f7fa
+    style PROCESS fill:#fff3e0
+    style BURST_WR fill:#e0f7fa
+    style OUTPUT fill:#ffebee
 ```
-帧缓冲 (DDR)
-    │  m_axi burst read (64-word bursts)
-    ▼
-  Row Buffer ──▶ RGB→Gray ──▶ 3-Line Buffer
-                                    │
-                              3×3 Kernel (Sobel/Laplacian/Dilate/Erode)
-                                    │
-                              ──▶ m_axi burst write
-                                    ▼
-                              目标帧缓冲 (DDR)
+
+#### 滤镜性能对比
+
+```mermaid
+xychart-beta
+    title "Sobel 3x3 滤镜帧率 (1280x720)"
+    x-axis ["PS软件", "HLS v1", "HLS v2 burst", "无滤镜上限"]
+    y-axis "FPS" 0 --> 35
+    bar [3.2, 13.3, 18.8, 31.7]
 ```
 
 **Burst 优化:**
