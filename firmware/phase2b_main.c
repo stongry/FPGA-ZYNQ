@@ -55,7 +55,7 @@ static const char *infer_mode_name[] = {"PS (float32)", "PL-CNN (TinyLeNet)"};
 /* ========== CNN TinyLeNet HLS accelerator MMIO ========== */
 /* Register map from Vitis HLS generated driver (xcnn_tinylenet_hls_hw.h) */
 #ifndef CNN_BASE
-#define CNN_BASE        0xA0020000UL  /* Vivado assigned: /cnn_hls/s_axi_ctrl/Reg */
+#define CNN_BASE        0xA0010000UL  /* Vivado hwh: /cnn_hls HIGHVALUE=0xA001FFFF */
 #endif
 #define CNN_AP_CTRL       (*(volatile uint32_t*)(CNN_BASE + 0x000))
 #define CNN_PRED          (*(volatile uint32_t*)(CNN_BASE + 0x010))
@@ -1032,7 +1032,7 @@ static void start_mnist_server(void) {
 #define PED_MAX_DETS 16
 
 #ifndef PED_BASE
-#define PED_BASE       0xA0010000UL  /* Vivado: /ped_hls/s_axi_ctrl */
+#define PED_BASE       0xA0020000UL  /* Vivado hwh: /ped_hls HIGHVALUE=0xA002FFFF */
 #endif
 #define PED_AP_CTRL       (*(volatile uint32_t*)(PED_BASE + 0x00))
 #define PED_IMAGE_ADDR_LO (*(volatile uint32_t*)(PED_BASE + 0x10))
@@ -1063,9 +1063,10 @@ static uint32_t g_ped_got = 0;
 static uint32_t g_ped_count = 0;
 
 static void ped_run_and_reply(struct tcp_pcb *tpcb) {
-    /* Copy image to DDR buffer and flush cache so PL DMA sees it */
+    /* Copy image to DDR buffer + barrier so PL DMA sees it */
     memcpy(PED_DDR_BUF, g_ped_buf, PED_IMG_SIZE);
     Xil_DCacheFlushRange((INTPTR)PED_DDR_BUF, PED_IMG_SIZE);
+    __asm__ volatile("dsb sy" ::: "memory");
 
     /* Pass DDR physical address to HLS via s_axilite */
     uintptr_t addr = (uintptr_t)PED_DDR_BUF;
