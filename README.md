@@ -81,51 +81,49 @@
 
 ### 全方法对比 — MNIST 手写数字识别 (10000 张测试集)
 
-#### 传统机器学习算法 (Python/x86 参考)
+#### 10 种算法全面对比 (FPGA 实测 + 传统 ML 参考)
 
-| 算法 | 准确率 | 单张耗时* | 模型大小 | 核心运算 | PL 可部署性 |
-|------|--------|----------|---------|---------|------------|
-| Template Matching | 63.4% | 0.02ms | 31KB | 相关运算 | 容易 |
-| Naive Bayes | 58.0% | 0.07ms | 63KB | 概率计算 | 困难 |
-| Linear SVM | 82.1% | 0.02ms | 31KB | 点积 | 容易 |
-| Logistic Regression | 89.4% | 0.03ms | 31KB | 矩阵乘 | 容易 |
-| KNN (k=3) | 90.9% | 5.31ms | 20MB | 距离计算 | 困难 |
-| Random Forest (50棵) | 93.2% | 0.01ms | ~5MB | 树遍历 | 困难 |
+| 排名 | 算法 | 准确率 | 计算位置 | 单张延迟 | LUT | DSP | 功耗 | 每次能耗 |
+|:----:|------|:------:|---------|:-------:|:---:|:---:|:----:|:-------:|
+| 1 | **CNN TinyLeNet** | **98.79%** | **PL FPGA** | **4.9ms** | 12.8% | 22.5% | 80mW | 0.39mJ |
+| 2 | FCN MLP float32 | 96.0% | PS ARM A53 | 3.9ms | 0 | 0 | 2.3W* | 9.0mJ |
+| 3 | MLP (numpy 训练) | 94.1% | 参考基准 | — | — | — | — | — |
+| 4 | Random Forest | 93.2% | 参考基准 | — | 难部署 | — | — | — |
+| 5 | **Matmul INT8** | **93.0%** | **PL FPGA** | **0.7ms** | 0.7% | 1.1% | 5mW | 0.004mJ |
+| 6 | KNN (k=3) | 91.8% | 参考基准 | — | 不可部署 | 需20MB | — | — |
+| 7 | Logistic Reg† | 89.4% | PL 可复用 | ~0.7ms | 0.7% | 1.1% | 5mW | 0.004mJ |
+| 8 | Linear SVM† | 81.9% | PL 可复用 | ~0.7ms | 0.7% | 1.1% | 5mW | 0.004mJ |
+| 9 | Template Match† | 63.1% | PL 可复用 | ~0.7ms | 0.7% | 1.1% | 5mW | 0.004mJ |
+| 10 | Naive Bayes | 58.0% | 参考基准 | — | 困难 | — | — | — |
 
-> *Python/x86 参考时间，仅做相对比较。实际 ARM A53 上约慢 5-10x。
+> *PS 功耗 2.3W 为整个 ARM 子系统共享，非推理独占
+> † 线性算法与 Matmul HLS 共用同一硬件 (784×10 矩阵乘)，仅权重不同
 
-#### 本项目 FPGA 实现 (板上实测)
-
-| 算法 | 准确率 | 单张延迟 | 吞吐量 | 模型大小 | 计算位置 |
-|------|--------|---------|--------|---------|---------|
-| **单层 Matmul INT8** | 93.0% | **0.7ms** | 1400 img/s | 8KB | PL FPGA |
-| **FCN MLP float32** | 96.0% | 4.1ms | 247 img/s | 200KB | PS ARM A53 |
-| **CNN TinyLeNet INT8** | **98.79%** | 5.6ms | 222 img/s | 嵌入BRAM | PL FPGA |
-
-#### 综合对比 (准确率 vs 复杂度)
+**关键发现：**
+- CNN TinyLeNet (PL) 以 **98.79%** 碾压所有传统算法，且功耗仅 80mW
+- Matmul INT8 (PL) 用 **不到 1% 资源** 就达到 93%，与 Random Forest 持平
+- 线性方法 (SVM/LogReg/Template) 可零成本复用 Matmul HLS 硬件，换权重即可
+- KNN/RF/NB 因存储或计算模式不适合 FPGA PL 部署
 
 ```
 准确率
  99% ┤                                          ★ CNN TinyLeNet (PL)
      │
  96% ┤                              ● FCN MLP (PS)
-     │
+ 94% ┤                           ◇ MLP (numpy)
  93% ┤              ▲ Random Forest    ○ Matmul INT8 (PL)
-     │          ◆ KNN
- 90% ┤      ■ Logistic Regression
+ 92% ┤          ◆ KNN
+ 89% ┤      ■ Logistic Regression†
      │
- 85% ┤
-     │  □ Linear SVM
- 80% ┤
+ 82% ┤  □ Linear SVM†
      │
- 65% ┤ △ Template Matching
-     │
+ 63% ┤ △ Template Matching†
  58% ┤ ▽ Naive Bayes
      └────────────────────────────────────────────────
          简单                  复杂度                 复杂
 
- ★ = PL FPGA CNN    ● = PS ARM CPU    ○ = PL FPGA 单层
- ▲□■◆ = 传统ML      △▽ = 最简单基线
+ ★ = PL CNN (98.79%, 80mW)     ● = PS MLP (96%, 2.3W)
+ ○ = PL Matmul (93%, 5mW)      † = 可复用 Matmul HLS 硬件
 ```
 
 ### 多方法对比 — MNIST 数字识别
