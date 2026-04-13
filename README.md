@@ -79,6 +79,55 @@
 - **行人检测**：PS 上几乎不可能实时，PL 实现 46 FPS 实时检测
 - **CPU 释放**：PL 加速器运行时 CPU 空闲，可同时处理网络 I/O 和其他任务
 
+### 全方法对比 — MNIST 手写数字识别 (10000 张测试集)
+
+#### 传统机器学习算法 (Python/x86 参考)
+
+| 算法 | 准确率 | 单张耗时* | 模型大小 | 核心运算 | PL 可部署性 |
+|------|--------|----------|---------|---------|------------|
+| Template Matching | 63.4% | 0.02ms | 31KB | 相关运算 | 容易 |
+| Naive Bayes | 58.0% | 0.07ms | 63KB | 概率计算 | 困难 |
+| Linear SVM | 82.1% | 0.02ms | 31KB | 点积 | 容易 |
+| Logistic Regression | 89.4% | 0.03ms | 31KB | 矩阵乘 | 容易 |
+| KNN (k=3) | 90.9% | 5.31ms | 20MB | 距离计算 | 困难 |
+| Random Forest (50棵) | 93.2% | 0.01ms | ~5MB | 树遍历 | 困难 |
+
+> *Python/x86 参考时间，仅做相对比较。实际 ARM A53 上约慢 5-10x。
+
+#### 本项目 FPGA 实现 (板上实测)
+
+| 算法 | 准确率 | 单张延迟 | 吞吐量 | 模型大小 | 计算位置 |
+|------|--------|---------|--------|---------|---------|
+| **单层 Matmul INT8** | 93.0% | **0.7ms** | 1400 img/s | 8KB | PL FPGA |
+| **FCN MLP float32** | 96.0% | 4.1ms | 247 img/s | 200KB | PS ARM A53 |
+| **CNN TinyLeNet INT8** | **98.79%** | 5.6ms | 222 img/s | 嵌入BRAM | PL FPGA |
+
+#### 综合对比 (准确率 vs 复杂度)
+
+```
+准确率
+ 99% ┤                                          ★ CNN TinyLeNet (PL)
+     │
+ 96% ┤                              ● FCN MLP (PS)
+     │
+ 93% ┤              ▲ Random Forest    ○ Matmul INT8 (PL)
+     │          ◆ KNN
+ 90% ┤      ■ Logistic Regression
+     │
+ 85% ┤
+     │  □ Linear SVM
+ 80% ┤
+     │
+ 65% ┤ △ Template Matching
+     │
+ 58% ┤ ▽ Naive Bayes
+     └────────────────────────────────────────────────
+         简单                  复杂度                 复杂
+
+ ★ = PL FPGA CNN    ● = PS ARM CPU    ○ = PL FPGA 单层
+ ▲□■◆ = 传统ML      △▽ = 最简单基线
+```
+
 ### 多方法对比 — MNIST 数字识别
 
 | 指标 | FCN (PS MLP) | CNN TinyLeNet (PL HLS) | 单层 Matmul (PL HLS) |
