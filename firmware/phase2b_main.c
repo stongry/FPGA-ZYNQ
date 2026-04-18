@@ -37,6 +37,11 @@
 
 /* INT8 single-layer weights for PL HLS accelerator */
 #include "mnist_data.h"
+#include "matmul_weights.h"
+#include "ped_simple_weights.h"
+#include "lpr36_weights.h"
+#include "lpr_cn31_weights.h"
+#include "plate_cnn_weights.h"
 
 /* ========== HLS PL accelerator MMIO ========== */
 #define HLS_BASE        0xA0010000UL
@@ -48,9 +53,22 @@
 #define AP_DONE   (1U << 1)
 #define AP_IDLE   (1U << 2)
 
-/* Inference engine selector: 0=PS float32, 1=PL-CNN TinyLeNet */
+/* Inference engine selector: 0=PS-MLP, 1=PL-CNN, 2=LogReg, 3=SVM, 4=Template,
+   5=LPR36 (36-class digit+letter), 6=CN31 (31-class Chinese province) */
+#define NUM_INFER_MODES 7
 static volatile int g_infer_mode = 1;
-static const char *infer_mode_name[] = {"PS (float32)", "PL-CNN (TinyLeNet)"};
+static const char *infer_mode_name[] = {
+    "PS-MLP (float32)", "PL-CNN (TinyLeNet)",
+    "LogReg (INT8)", "SVM (INT8)", "Template (INT8)",
+    "LPR36 (0-9,A-Z INT8)", "CN31 (Chinese province INT8)"
+};
+
+/* PED mode selector: 0=HOG+SVM PL, 1=Pixel+SVM PS, 2=Pixel+NB PS, 3=Template PS */
+#define NUM_PED_MODES 4
+static volatile int g_ped_mode = 0;
+static const char *ped_mode_name[] = {
+    "HOG+SVM (PL)", "Pixel+SVM (PS)", "Pixel+NB (PS)", "Template (PS)"
+};
 
 /* ========== CNN TinyLeNet HLS accelerator MMIO ========== */
 /* Register map from Vitis HLS generated driver (xcnn_tinylenet_hls_hw.h) */
@@ -536,8 +554,12 @@ static void handle_uart_cmd(int c) {
     case 'e': case 'E':           set_filter(FLT_ERODE);       break;
     case 'o': case 'O':           set_filter(FLT_OTSU);        break;
     case 'm': case 'M':
-        g_infer_mode = (g_infer_mode + 1) % 2;
+        g_infer_mode = (g_infer_mode + 1) % NUM_INFER_MODES;
         xil_printf("[cnn] MNIST engine -> %s\r\n", infer_mode_name[g_infer_mode]);
+        break;
+    case 'z': case 'Z':
+        g_ped_mode = (g_ped_mode + 1) % NUM_PED_MODES;
+        xil_printf("[ped] PED engine -> %s\r\n", ped_mode_name[g_ped_mode]);
         break;
     case '?':                     print_filter_help();         break;
     default: break;
@@ -858,6 +880,114 @@ static void start_tcp_server(void) {
 }
 
 /* =========================================================================
+ *  CN31 31-class Chinese province MLP inference (784 -> 128 -> 31)
+ *  Classes: 京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼
+ * ========================================================================= */
+static void cn31_infer(const uint8_t img[784], uint8_t *pred_out, float probs[10]) {
+    static float h1[CN31_HIDDEN];
+    static float z2[CN31_CLASSES];
+
+    for (int j = 0; j < CN31_HIDDEN; j++) {
+        int32_t acc = 0;
+        const int8_t *wrow = cn31_W1[j];
+        for (int i = 0; i < 784; i++)
+            acc += (int32_t)img[i] * (int32_t)wrow[i];
+        float s = (float)acc * (cn31_s1 / 255.0f) + cn31_b1[j];
+        h1[j] = (s > 0.0f) ? s : 0.0f;
+    }
+
+    int argmax = 0; float maxv = -1e30f;
+    for (int k = 0; k < CN31_CLASSES; k++) {
+        float acc = 0.0f;
+        const int8_t *wrow = cn31_W2[k];
+        for (int j = 0; j < CN31_HIDDEN; j++)
+            acc += h1[j] * (float)wrow[j];
+        z2[k] = acc * cn31_s2 + cn31_b2[k];
+        if (z2[k] > maxv) { maxv = z2[k]; argmax = k; }
+    }
+    *pred_out = (uint8_t)argmax;
+
+    /* First 10 probs for protocol compat */
+    float mx = maxv, sum = 0.0f;
+    static float all[CN31_CLASSES];
+    for (int k = 0; k < CN31_CLASSES; k++) { all[k] = expf(z2[k] - mx); sum += all[k]; }
+    for (int k = 0; k < 10; k++) probs[k] = (k < CN31_CLASSES) ? all[k] / sum : 0.0f;
+}
+
+/* =========================================================================
+ *  LPR 36-class MLP inference (784 -> 64 -> 36) for license plate recognition
+ *  Classes: 0-9 (idx 0-9), A-Z (idx 10-35); maps to char via lpr36_chars[]
+ * ========================================================================= */
+static void lpr36_infer(const uint8_t img[784], uint8_t *pred_out, float probs[10]) {
+    static float h1[LPR36_HIDDEN];
+    static float z2[LPR36_CLASSES];
+
+    /* Layer 1: 784 uint8 @ int8 W1 + float b1 + ReLU */
+    for (int j = 0; j < LPR36_HIDDEN; j++) {
+        int32_t acc = 0;
+        const int8_t *wrow = lpr36_W1[j];
+        for (int i = 0; i < 784; i++)
+            acc += (int32_t)img[i] * (int32_t)wrow[i];
+        float s = (float)acc * (lpr36_s1 / 255.0f) + lpr36_b1[j];
+        h1[j] = (s > 0.0f) ? s : 0.0f;
+    }
+
+    /* Layer 2: float h1 @ int8 W2 + float b2 (no activation; argmax) */
+    int argmax = 0; float maxv = -1e30f;
+    for (int k = 0; k < LPR36_CLASSES; k++) {
+        float acc = 0.0f;
+        const int8_t *wrow = lpr36_W2[k];
+        for (int j = 0; j < LPR36_HIDDEN; j++)
+            acc += h1[j] * (float)wrow[j];
+        z2[k] = acc * lpr36_s2 + lpr36_b2[k];
+        if (z2[k] > maxv) { maxv = z2[k]; argmax = k; }
+    }
+    *pred_out = (uint8_t)argmax;
+
+    /* Fill first 10 probs slots with top-10 class softmax for protocol compat */
+    float mx = maxv;
+    float sum = 0.0f;
+    static float all[LPR36_CLASSES];
+    for (int k = 0; k < LPR36_CLASSES; k++) { all[k] = expf(z2[k] - mx); sum += all[k]; }
+    for (int k = 0; k < 10; k++) probs[k] = all[k] / sum;
+}
+
+/* =========================================================================
+ *  INT8 Matmul inference (784x10) for LogReg / SVM / Template
+ *  Same arithmetic as Matmul HLS IP: score[k] = sum(img[i] * W[k][i]) + B[k]
+ * ========================================================================= */
+static void mnist_infer_matmul(const uint8_t img[784], uint8_t *pred_out,
+                               float probs[10],
+                               const int8_t W[10][784], const int16_t B[10])
+{
+    int32_t scores[10];
+    int32_t max_score;
+    int argmax = 0;
+
+    for (int k = 0; k < 10; k++) {
+        int32_t acc = (int32_t)B[k];
+        for (int i = 0; i < 784; i++)
+            acc += (int32_t)img[i] * (int32_t)W[k][i];
+        scores[k] = acc;
+    }
+
+    max_score = scores[0];
+    for (int k = 1; k < 10; k++) {
+        if (scores[k] > max_score) { max_score = scores[k]; argmax = k; }
+    }
+    *pred_out = (uint8_t)argmax;
+
+    /* convert scores to pseudo-probabilities via softmax for reply format */
+    float mx = (float)max_score;
+    float sum = 0.0f;
+    for (int k = 0; k < 10; k++) {
+        probs[k] = expf((float)scores[k] - mx);
+        sum += probs[k];
+    }
+    for (int k = 0; k < 10; k++) probs[k] /= sum;
+}
+
+/* =========================================================================
  *  MNIST HANDWRITTEN-DIGIT RECOGNITION
  *  - 2-layer MLP (784 -> MNIST_HIDDEN -> 10), weights in mnist_weights.h
  *  - Second TCP server on port 5001 for inference requests
@@ -922,10 +1052,15 @@ static uint32_t g_mnist_count = 0;
 static void mnist_run_and_reply(struct tcp_pcb *tpcb) {
     uint8_t pred;
     float probs[10];
-    if (g_infer_mode == 1)
-        mnist_infer_cnn(g_mnist_buf, &pred, probs);
-    else
-        mnist_infer(g_mnist_buf, &pred, probs);
+    switch (g_infer_mode) {
+    case 1:  mnist_infer_cnn(g_mnist_buf, &pred, probs); break;
+    case 2:  mnist_infer_matmul(g_mnist_buf, &pred, probs, logreg_W, logreg_B); break;
+    case 3:  mnist_infer_matmul(g_mnist_buf, &pred, probs, svm_W, svm_B); break;
+    case 4:  mnist_infer_matmul(g_mnist_buf, &pred, probs, tmpl_W, tmpl_B); break;
+    case 5:  lpr36_infer(g_mnist_buf, &pred, probs); break;
+    case 6:  cn31_infer(g_mnist_buf, &pred, probs); break;
+    default: mnist_infer(g_mnist_buf, &pred, probs); break;
+    }
     g_mnist_count++;
 
     /* format reply: "CLS\0" + pred(1) + pad(3) + 10 * float32 */
@@ -1062,44 +1197,108 @@ static uint8_t  g_ped_buf[PED_IMG_SIZE];
 static uint32_t g_ped_got = 0;
 static uint32_t g_ped_count = 0;
 
+/* Extract center 64x128 patch from 320x240 image (g_ped_buf) into out[8192] */
+static void extract_center_patch(const uint8_t *src320x240, uint8_t out[8192]) {
+    /* Center: x=128, y=56, width=64, height=128 */
+    const int X0 = 128, Y0 = 56;
+    for (int r = 0; r < 128; r++) {
+        for (int c = 0; c < 64; c++) {
+            out[r*64 + c] = src320x240[(Y0+r)*320 + (X0+c)];
+        }
+    }
+}
+
+/* Pixel+SVM: linear classifier on 8192-dim patch */
+static int ped_infer_pixel_svm(const uint8_t patch[8192], int32_t *score_out) {
+    int32_t acc = psvm_B;
+    for (int i = 0; i < 8192; i++)
+        acc += (int32_t)patch[i] * (int32_t)psvm_W[i];
+    *score_out = acc;
+    return (acc > 0) ? 1 : 0;
+}
+
+/* Pixel+NB: Gaussian Naive Bayes binary classifier */
+static int ped_infer_pixel_nb(const uint8_t patch[8192], int32_t *score_out) {
+    float score0 = pnb_logprior[0];
+    float score1 = pnb_logprior[1];
+    for (int i = 0; i < 8192; i++) {
+        float d0 = (float)patch[i] - (float)pnb_mean[0][i];
+        float d1 = (float)patch[i] - (float)pnb_mean[1][i];
+        score0 += -pnb_log_var[0][i] - d0*d0 * pnb_inv_2var[0][i];
+        score1 += -pnb_log_var[1][i] - d1*d1 * pnb_inv_2var[1][i];
+    }
+    /* Scale float diff to int32 for reply */
+    float diff = score1 - score0;
+    *score_out = (int32_t)diff;
+    return (diff > 0) ? 1 : 0;
+}
+
+/* Template: dot product with (pos - neg) template */
+static int ped_infer_template(const uint8_t patch[8192], int32_t *score_out) {
+    int32_t acc = 0;
+    for (int i = 0; i < 8192; i++)
+        acc += (int32_t)patch[i] * (int32_t)tmpl_diff[i];
+    *score_out = acc;
+    return (acc > 0) ? 1 : 0;
+}
+
 static void ped_run_and_reply(struct tcp_pcb *tpcb) {
-    /* Copy image to DDR buffer + barrier so PL DMA sees it */
-    memcpy(PED_DDR_BUF, g_ped_buf, PED_IMG_SIZE);
-    Xil_DCacheFlushRange((INTPTR)PED_DDR_BUF, PED_IMG_SIZE);
-    __asm__ volatile("dsb sy" ::: "memory");
+    int n_dets;
+    int32_t pos_det = 0;
+    int32_t score_det = 0;
 
-    /* Pass DDR physical address to HLS via s_axilite */
-    uintptr_t addr = (uintptr_t)PED_DDR_BUF;
-    PED_IMAGE_ADDR_LO = (uint32_t)(addr & 0xFFFFFFFF);
-    PED_IMAGE_ADDR_HI = (uint32_t)(addr >> 32);
+    if (g_ped_mode == 0) {
+        /* HOG+SVM PL (original path) */
+        memcpy(PED_DDR_BUF, g_ped_buf, PED_IMG_SIZE);
+        Xil_DCacheFlushRange((INTPTR)PED_DDR_BUF, PED_IMG_SIZE);
+        __asm__ volatile("dsb sy" ::: "memory");
 
-    /* Set threshold and trigger */
-    PED_THRESHOLD = 0;
-    PED_AP_CTRL = PED_AP_START;
+        uintptr_t addr = (uintptr_t)PED_DDR_BUF;
+        PED_IMAGE_ADDR_LO = (uint32_t)(addr & 0xFFFFFFFF);
+        PED_IMAGE_ADDR_HI = (uint32_t)(addr >> 32);
+        PED_THRESHOLD = 0;
+        PED_AP_CTRL = PED_AP_START;
+        for (volatile int t = 0; t < 50000000; t++)
+            if (PED_AP_CTRL & PED_AP_DONE) break;
 
-    /* Poll until done */
-    for (volatile int t = 0; t < 50000000; t++)
-        if (PED_AP_CTRL & PED_AP_DONE) break;
-
-    int n_dets = (int)PED_NUM_DETS;
-    if (n_dets > PED_MAX_DETS) n_dets = PED_MAX_DETS;
+        n_dets = (int)PED_NUM_DETS;
+        if (n_dets > PED_MAX_DETS) n_dets = PED_MAX_DETS;
+    } else {
+        /* PS-side simple classifier on center 64x128 patch */
+        static uint8_t patch[8192];
+        extract_center_patch(g_ped_buf, patch);
+        int is_ped;
+        switch (g_ped_mode) {
+        case 1:  is_ped = ped_infer_pixel_svm(patch, &score_det); break;
+        case 2:  is_ped = ped_infer_pixel_nb (patch, &score_det); break;
+        case 3:  is_ped = ped_infer_template (patch, &score_det); break;
+        default: is_ped = 0; break;
+        }
+        n_dets = is_ped ? 1 : 0;
+        pos_det = 0;  /* center patch location */
+    }
     g_ped_count++;
 
     /* Reply: "DET\0" + n_dets(4) + n_dets * {pos_word(4) + score_word(4)} */
     uint8_t rep[8 + PED_MAX_DETS * 8];
     rep[0] = 'D'; rep[1] = 'E'; rep[2] = 'T'; rep[3] = 0;
     memcpy(&rep[4], &n_dets, 4);
-    for (int i = 0; i < n_dets; i++) {
-        int32_t pos   = PED_DET(i * 2);
-        int32_t score = PED_DET(i * 2 + 1);
-        memcpy(&rep[8 + i * 8], &pos, 4);
-        memcpy(&rep[8 + i * 8 + 4], &score, 4);
+    if (g_ped_mode == 0) {
+        for (int i = 0; i < n_dets; i++) {
+            int32_t pos   = PED_DET(i * 2);
+            int32_t score = PED_DET(i * 2 + 1);
+            memcpy(&rep[8 + i * 8], &pos, 4);
+            memcpy(&rep[8 + i * 8 + 4], &score, 4);
+        }
+    } else if (n_dets > 0) {
+        memcpy(&rep[8], &pos_det, 4);
+        memcpy(&rep[12], &score_det, 4);
     }
     int reply_len = 8 + n_dets * 8;
     tcp_write(tpcb, rep, reply_len, TCP_WRITE_FLAG_COPY);
     tcp_output(tpcb);
 
-    xil_printf("[ped] #%d -> %d detections\r\n", g_ped_count, n_dets);
+    xil_printf("[%s] #%d -> %d dets\r\n", ped_mode_name[g_ped_mode], g_ped_count, n_dets);
 }
 
 static err_t ped_recv_cb(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err)
@@ -1167,6 +1366,213 @@ static void start_ped_server(void) {
     xil_printf("[ped] Pedestrian detection server on port 5002\r\n");
     xil_printf("      protocol: PED\\0 + w(4)=320 + h(4)=240 + fmt(4) + 76800 bytes u8\r\n");
     xil_printf("      reply:    DET\\0 + n(4) + n * {pos(4)+score(4)}\r\n");
+}
+
+/* =========================================================================
+ *  End-to-end Plate CNN (128x32 full plate → 7 char prediction)
+ *  Architecture: 4x Conv3x3+BN+ReLU+Pool2x2 → FC(4096→512) → 7 heads
+ *  Trained on 87K real Chinese plates. Val acc: 98.63%.
+ *  PS software inference on ARM A53 (~300-500ms per plate).
+ * ========================================================================= */
+#define PCN_PLATE_BYTES (128 * 32)
+
+/* Two ping-pong activation buffers in DDR */
+static float pcn_buf_a[32 * 16 * 64]; /* max 32K floats = 128KB */
+static float pcn_buf_b[32 * 16 * 64]; /* max 32K floats = 128KB */
+static float pcn_fc_out[512];
+static uint8_t g_plate_img[PCN_PLATE_BYTES];
+
+static void pcn_conv3x3_relu_pool(
+    const float *in, float *out,
+    const int8_t *W_flat, const float *bias, float scale,
+    int Cin, int Cout, int H, int W)
+{
+    int Ho = H / 2, Wo = W / 2;
+    for (int oc = 0; oc < Cout; oc++) {
+        float bi = bias[oc];
+        for (int yo = 0; yo < Ho; yo++) {
+            for (int xo = 0; xo < Wo; xo++) {
+                float m = 0.0f;  /* after ReLU, min is 0 */
+                for (int dy = 0; dy < 2; dy++) {
+                    for (int dx = 0; dx < 2; dx++) {
+                        int y = 2*yo + dy;
+                        int x = 2*xo + dx;
+                        float acc = bi;
+                        for (int ic = 0; ic < Cin; ic++) {
+                            const int8_t *wptr = &W_flat[oc*Cin*9 + ic*9];
+                            const float *iptr = &in[ic*H*W];
+                            for (int ky = 0; ky < 3; ky++) {
+                                int iy = y + ky - 1;
+                                if (iy < 0 || iy >= H) continue;
+                                for (int kx = 0; kx < 3; kx++) {
+                                    int ix = x + kx - 1;
+                                    if (ix < 0 || ix >= W) continue;
+                                    float w_v = wptr[ky*3 + kx] * scale;
+                                    acc += iptr[iy*W + ix] * w_v;
+                                }
+                            }
+                        }
+                        if (acc > m) m = acc;
+                    }
+                }
+                out[oc*Ho*Wo + yo*Wo + xo] = m;
+            }
+        }
+    }
+}
+
+static void pcn_fc_relu(const float *in, float *out, int N_in, int N_out,
+                         const int8_t *W_flat, const float *bias, float scale, int apply_relu)
+{
+    for (int o = 0; o < N_out; o++) {
+        float acc = bias[o];
+        const int8_t *wrow = &W_flat[o * N_in];
+        for (int i = 0; i < N_in; i++)
+            acc += in[i] * (wrow[i] * scale);
+        if (apply_relu && acc < 0) acc = 0;
+        out[o] = acc;
+    }
+}
+
+static int pcn_argmax(const float *v, int n) {
+    int best = 0; float mx = v[0];
+    for (int i = 1; i < n; i++)
+        if (v[i] > mx) { mx = v[i]; best = i; }
+    return best;
+}
+
+/* Run CNN inference on 128x32 plate image.
+   Returns: province_idx (0-30) + alnum_idx[0-5] (0-35 each). */
+static void pcn_infer(const uint8_t plate_128x32[PCN_PLATE_BYTES],
+                       uint8_t *prov_out, uint8_t alnum_out[6])
+{
+    /* Convert to float [0,1] in buf_a */
+    for (int i = 0; i < PCN_PLATE_BYTES; i++)
+        pcn_buf_a[i] = plate_128x32[i] * (1.0f / 255.0f);
+
+    /* Conv1: (1,32,128) → (32,16,64) */
+    pcn_conv3x3_relu_pool(pcn_buf_a, pcn_buf_b,
+        (const int8_t*)pcn_c1W, pcn_c1b, pcn_s_c1, 1, 32, 32, 128);
+    /* Conv2: (32,16,64) → (64,8,32) */
+    pcn_conv3x3_relu_pool(pcn_buf_b, pcn_buf_a,
+        (const int8_t*)pcn_c2W, pcn_c2b, pcn_s_c2, 32, 64, 16, 64);
+    /* Conv3: (64,8,32) → (128,4,16) */
+    pcn_conv3x3_relu_pool(pcn_buf_a, pcn_buf_b,
+        (const int8_t*)pcn_c3W, pcn_c3b, pcn_s_c3, 64, 128, 8, 32);
+    /* Conv4: (128,4,16) → (256,2,8) */
+    pcn_conv3x3_relu_pool(pcn_buf_b, pcn_buf_a,
+        (const int8_t*)pcn_c4W, pcn_c4b, pcn_s_c4, 128, 256, 4, 16);
+
+    /* FC: 4096 → 512 + ReLU */
+    pcn_fc_relu(pcn_buf_a, pcn_fc_out, 4096, 512,
+        (const int8_t*)pcn_fcW, pcn_fcb, pcn_s_fc, 1);
+
+    /* Heads */
+    float cn_scores[31];
+    pcn_fc_relu(pcn_fc_out, cn_scores, 512, 31,
+        (const int8_t*)pcn_hcnW, pcn_hcnb, pcn_s_hcn, 0);
+    *prov_out = (uint8_t)pcn_argmax(cn_scores, 31);
+    for (int h = 0; h < 6; h++) {
+        float al_scores[36];
+        pcn_fc_relu(pcn_fc_out, al_scores, 512, 36,
+            (const int8_t*)pcn_halW[h], pcn_halb[h], pcn_s_hal[h], 0);
+        alnum_out[h] = (uint8_t)pcn_argmax(al_scores, 36);
+    }
+}
+
+/* =========================================================================
+ *  Plate CNN TCP server (port 5003)
+ *  Protocol: client sends "PLT\0" + w(4)=128 + h(4)=32 + fmt(4) + 4096 u8
+ *            board replies "PRD\0" + prov(1) + al[6] (7 bytes total after magic)
+ * ========================================================================= */
+#define PLT_HDR_BYTES 16
+
+typedef enum { PLT_HDR, PLT_DATA } plt_state_t;
+static plt_state_t g_plt_state = PLT_HDR;
+static uint8_t g_plt_hdr[PLT_HDR_BYTES];
+static uint32_t g_plt_hdr_got = 0;
+static uint32_t g_plt_got = 0;
+static uint32_t g_plt_count = 0;
+
+static void plt_run_and_reply(struct tcp_pcb *tpcb) {
+    uint8_t prov; uint8_t al[6];
+    pcn_infer(g_plate_img, &prov, al);
+    g_plt_count++;
+    uint8_t rep[4 + 1 + 6];
+    rep[0]='P'; rep[1]='R'; rep[2]='D'; rep[3]=0;
+    rep[4] = prov;
+    for (int i = 0; i < 6; i++) rep[5+i] = al[i];
+    tcp_write(tpcb, rep, sizeof(rep), TCP_WRITE_FLAG_COPY);
+    tcp_output(tpcb);
+    xil_printf("[plt] #%d -> prov=%d al=[%d,%d,%d,%d,%d,%d]\r\n",
+               g_plt_count, prov, al[0], al[1], al[2], al[3], al[4], al[5]);
+}
+
+static err_t plt_recv_cb(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err)
+{
+    (void)arg;
+    if (!p) { tcp_close(tpcb); return ERR_OK; }
+    if (err != ERR_OK) { pbuf_free(p); return err; }
+    tcp_recved(tpcb, p->tot_len);
+
+    for (struct pbuf *q = p; q; q = q->next) {
+        const uint8_t *bytes = (const uint8_t *)q->payload;
+        uint32_t remain = q->len;
+        while (remain > 0) {
+            if (g_plt_state == PLT_HDR) {
+                uint32_t need = PLT_HDR_BYTES - g_plt_hdr_got;
+                uint32_t take = remain < need ? remain : need;
+                memcpy(&g_plt_hdr[g_plt_hdr_got], bytes, take);
+                g_plt_hdr_got += take;
+                bytes += take; remain -= take;
+                if (g_plt_hdr_got == PLT_HDR_BYTES) {
+                    if (!(g_plt_hdr[0]=='P' && g_plt_hdr[1]=='L' &&
+                          g_plt_hdr[2]=='T' && g_plt_hdr[3]==0)) {
+                        xil_printf("[plt] bad magic, reset\r\n");
+                        g_plt_hdr_got = 0;
+                        continue;
+                    }
+                    g_plt_got = 0;
+                    g_plt_state = PLT_DATA;
+                }
+            } else {
+                uint32_t need = PCN_PLATE_BYTES - g_plt_got;
+                uint32_t take = remain < need ? remain : need;
+                memcpy(&g_plate_img[g_plt_got], bytes, take);
+                g_plt_got += take;
+                bytes += take; remain -= take;
+                if (g_plt_got == PCN_PLATE_BYTES) {
+                    plt_run_and_reply(tpcb);
+                    g_plt_hdr_got = 0;
+                    g_plt_state = PLT_HDR;
+                }
+            }
+        }
+    }
+    pbuf_free(p);
+    return ERR_OK;
+}
+
+static err_t plt_accept_cb(void *arg, struct tcp_pcb *newpcb, err_t err) {
+    (void)arg; (void)err;
+    xil_printf("[plt] accept from %d.%d.%d.%d\r\n",
+               ip4_addr1(&newpcb->remote_ip), ip4_addr2(&newpcb->remote_ip),
+               ip4_addr3(&newpcb->remote_ip), ip4_addr4(&newpcb->remote_ip));
+    tcp_recv(newpcb, plt_recv_cb);
+    g_plt_state   = PLT_HDR;
+    g_plt_hdr_got = 0;
+    g_plt_got     = 0;
+    return ERR_OK;
+}
+
+static void start_plt_server(void) {
+    struct tcp_pcb *pcb = tcp_new();
+    tcp_bind(pcb, IP_ADDR_ANY, 5003);
+    pcb = tcp_listen(pcb);
+    tcp_accept(pcb, plt_accept_cb);
+    xil_printf("[plt] Plate CNN server on port 5003 (end-to-end CNN)\r\n");
+    xil_printf("      protocol: PLT\\0 + w=128 + h=32 + fmt + 4096 u8\r\n");
+    xil_printf("      reply:    PRD\\0 + prov(1) + al[6]\r\n");
 }
 
 /* ========== main ========== */
@@ -1298,6 +1704,7 @@ int main(void) {
     start_tcp_server();
     start_mnist_server();
     start_ped_server();
+    start_plt_server();
     print_filter_help();
 
     /* 4. Main loop: drain lwIP queue + poll UART for filter commands */
