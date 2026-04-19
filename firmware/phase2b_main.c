@@ -42,6 +42,7 @@
 #include "lpr36_weights.h"
 #include "lpr_cn31_weights.h"
 #include "plate_cnn_weights.h"
+#include "plate_cnn_fc_weights.h"  /* 2MB FC weights for PL CNN */
 
 /* ========== HLS PL accelerator MMIO ========== */
 #define HLS_BASE        0xA0010000UL
@@ -66,6 +67,11 @@ static const char *infer_mode_name[] = {
 /* PED mode selector: 0=HOG+SVM PL, 1=Pixel+SVM PS, 2=Pixel+NB PS, 3=Template PS */
 #define NUM_PED_MODES 4
 static volatile int g_ped_mode = 0;
+
+/* Forward decls for V key toggle */
+static volatile int g_plt_use_pl;
+static int g_plt_pl_inited;
+static void plt_cnn_init_pl(void);
 static const char *ped_mode_name[] = {
     "HOG+SVM (PL)", "Pixel+SVM (PS)", "Pixel+NB (PS)", "Template (PS)"
 };
@@ -560,6 +566,11 @@ static void handle_uart_cmd(int c) {
     case 'z': case 'Z':
         g_ped_mode = (g_ped_mode + 1) % NUM_PED_MODES;
         xil_printf("[ped] PED engine -> %s\r\n", ped_mode_name[g_ped_mode]);
+        break;
+    case 'v': case 'V':
+        g_plt_use_pl = !g_plt_use_pl;
+        xil_printf("[plt] Plate CNN -> %s\r\n", g_plt_use_pl ? "PL HLS" : "PS software");
+        if (g_plt_use_pl && !g_plt_pl_inited) plt_cnn_init_pl();
         break;
     case '?':                     print_filter_help();         break;
     default: break;
@@ -1494,9 +1505,127 @@ static uint32_t g_plt_hdr_got = 0;
 static uint32_t g_plt_got = 0;
 static uint32_t g_plt_count = 0;
 
+/* ========================================================================
+ *  PL Plate CNN accelerator (new, v5 model, PL HLS)
+ *  AXI-Lite base: 0xA0000000 (v15 clean crossbar — sole PL slave)
+ *
+ *  Register layout (from xplate_cnn_hls_hw.h):
+ *    0x0000 AP_CTRL      (start/done/idle)
+ *    0x0010 FC_ADDR_LO   (fc_weights_addr[31:0]   — 64-bit scalar)
+ *    0x0014 FC_ADDR_HI   (fc_weights_addr[63:32])
+ *    0x001c FC_DDR_LO    (fc_weights_ddr[31:0]    — m_axi offset scalar)
+ *    0x0020 FC_DDR_HI    (fc_weights_ddr[63:32])
+ *    0x0028 PRED[0..6]   (7 bytes)
+ *    0x1000 IMAGE[4096]  (BRAM)
+ *
+ *  Toggle PS/PL inference with g_plt_use_pl (UART 'V' key).
+ * ======================================================================== */
+#define PLT_CNN_BASE     0xA0000000UL
+#define PLT_CNN_AP_CTRL  (*(volatile uint32_t *)(PLT_CNN_BASE + 0x000))
+#define PLT_CNN_FC_ADDR_LO (*(volatile uint32_t *)(PLT_CNN_BASE + 0x010))
+#define PLT_CNN_FC_ADDR_HI (*(volatile uint32_t *)(PLT_CNN_BASE + 0x014))
+#define PLT_CNN_FC_DDR_LO  (*(volatile uint32_t *)(PLT_CNN_BASE + 0x01c))
+#define PLT_CNN_FC_DDR_HI  (*(volatile uint32_t *)(PLT_CNN_BASE + 0x020))
+#define PLT_CNN_PRED     ((volatile uint8_t *)(PLT_CNN_BASE + 0x028))
+#define PLT_CNN_IMG_REG  ((volatile uint8_t *)(PLT_CNN_BASE + 0x1000))
+
+#define PLT_AP_START (1U << 0)
+#define PLT_AP_DONE  (1U << 1)
+
+static volatile int g_plt_use_pl = 0;  /* 0=PS CNN (default), 1=PL CNN HLS */
+static int g_plt_pl_inited = 0;
+
+/* FC weights live in .rodata (DDR ddr_low region, MMU-mapped cacheable).
+ * JTAG dow writes DRAM directly (bypasses CPU cache), so cache is empty for
+ * .rodata on boot. CPU reads always miss cache → fetch from DRAM. HLS m_axi
+ * reads via HP0 hit the same DRAM. No flush needed. */
+static void plt_cnn_init_pl(void) {
+    if (g_plt_pl_inited) return;
+    g_plt_pl_inited = 1;
+    xil_printf("[plt] FC weights at 0x%08lx (%d bytes, rodata)\r\n",
+               (unsigned long)(uintptr_t)plate_cnn_fc_weights,
+               PCN_FC_WEIGHTS_SIZE);
+}
+
+/* DIAG: 0=full plate_cnn_hls, 1=dummy, 2=cnn_hls probe, 3=gpio probe */
+static int g_pl_diag_mode = 0;
+
+/* Run CNN on PL HLS */
+static void plt_cnn_run_pl(const uint8_t image[PCN_PLATE_BYTES],
+                            uint8_t *prov, uint8_t al[6]) {
+    xil_printf("[PL] enter (diag=%d)\r\n", g_pl_diag_mode);
+    if (g_pl_diag_mode == 1) {
+        *prov = 1; for (int i = 0; i < 6; i++) al[i] = i + 10;
+        xil_printf("[PL] diag1 return\r\n");
+        return;
+    }
+    if (g_pl_diag_mode == 2) {
+        xil_printf("[PL] diag2: read cnn_hls AP_CTRL@A0010000\r\n");
+        volatile uint32_t *mnist_ap = (volatile uint32_t *)0xA0010000UL;
+        uint32_t v = *mnist_ap;
+        xil_printf("[PL] diag2: cnn_hls AP_CTRL = 0x%x\r\n", v);
+        xil_printf("[PL] diag2: read plate_cnn AP_CTRL@A0020000\r\n");
+        uint32_t v2 = PLT_CNN_AP_CTRL;
+        xil_printf("[PL] diag2: plate_cnn AP_CTRL = 0x%x\r\n", v2);
+        *prov = 2; for (int i = 0; i < 6; i++) al[i] = 20 + i;
+        return;
+    }
+    if (g_pl_diag_mode == 3) {
+        xil_printf("[PL] diag3: read GPIO@A0000000\r\n");
+        volatile uint32_t *gpio = (volatile uint32_t *)0xA0000000UL;
+        uint32_t vg = *gpio;
+        xil_printf("[PL] diag3: GPIO = 0x%x\r\n", vg);
+        xil_printf("[PL] diag3: read cnn_hls@A0010000\r\n");
+        volatile uint32_t *mnist_ap = (volatile uint32_t *)0xA0010000UL;
+        uint32_t vm = *mnist_ap;
+        xil_printf("[PL] diag3: cnn_hls = 0x%x\r\n", vm);
+        *prov = 3; for (int i = 0; i < 6; i++) al[i] = 30 + i;
+        return;
+    }
+    /* Drain any leftover ap_done from previous run (read clears bit 1).
+     * Then wait up to 500ms for ap_idle=1 before proceeding. */
+    (void)PLT_CNN_AP_CTRL;
+    for (volatile uint32_t w = 0; w < 600000000U; w++) {
+        uint32_t c = PLT_CNN_AP_CTRL;
+        if (c & (1U << 2)) break;  /* idle */
+    }
+    /* 32-bit word writes to image BRAM (1024 transactions vs 4096 byte) */
+    xil_printf("[PL] step2: write image\r\n");
+    volatile uint32_t *dst32 = (volatile uint32_t *)PLT_CNN_IMG_REG;
+    const uint32_t *src32 = (const uint32_t *)image;
+    for (int i = 0; i < PCN_PLATE_BYTES / 4; i++) dst32[i] = src32[i];
+    xil_printf("[PL] step3: write FC addr\r\n");
+    uintptr_t fc_addr = (uintptr_t)plate_cnn_fc_weights;
+    PLT_CNN_FC_ADDR_LO = (uint32_t)(fc_addr & 0xFFFFFFFF);
+    PLT_CNN_FC_ADDR_HI = (uint32_t)(fc_addr >> 32);
+    PLT_CNN_FC_DDR_LO  = (uint32_t)(fc_addr & 0xFFFFFFFF);
+    PLT_CNN_FC_DDR_HI  = (uint32_t)(fc_addr >> 32);
+    xil_printf("[PL] step4: start\r\n");
+    PLT_CNN_AP_CTRL = PLT_AP_START;
+    xil_printf("[PL] step5: poll\r\n");
+    int timed_out = 1;
+    for (volatile uint32_t t = 0; t < 600000000U; t++) {
+        if (PLT_CNN_AP_CTRL & PLT_AP_DONE) { timed_out = 0; break; }
+    }
+    if (timed_out) {
+        xil_printf("[PL] TIMEOUT ap_ctrl=0x%x\r\n", PLT_CNN_AP_CTRL);
+        *prov = 0; for (int i = 0; i < 6; i++) al[i] = 0;
+        return;
+    }
+    xil_printf("[PL] step6: read preds\r\n");
+    *prov = PLT_CNN_PRED[0];
+    for (int i = 0; i < 6; i++) al[i] = PLT_CNN_PRED[1 + i];
+    xil_printf("[PL] done prov=%d\r\n", *prov);
+}
+
 static void plt_run_and_reply(struct tcp_pcb *tpcb) {
     uint8_t prov; uint8_t al[6];
-    pcn_infer(g_plate_img, &prov, al);
+    if (g_plt_use_pl) {
+        if (!g_plt_pl_inited) plt_cnn_init_pl();
+        plt_cnn_run_pl(g_plate_img, &prov, al);
+    } else {
+        pcn_infer(g_plate_img, &prov, al);
+    }
     g_plt_count++;
     uint8_t rep[4 + 1 + 6];
     rep[0]='P'; rep[1]='R'; rep[2]='D'; rep[3]=0;
@@ -1504,7 +1633,8 @@ static void plt_run_and_reply(struct tcp_pcb *tpcb) {
     for (int i = 0; i < 6; i++) rep[5+i] = al[i];
     tcp_write(tpcb, rep, sizeof(rep), TCP_WRITE_FLAG_COPY);
     tcp_output(tpcb);
-    xil_printf("[plt] #%d -> prov=%d al=[%d,%d,%d,%d,%d,%d]\r\n",
+    xil_printf("[plt-%s] #%d -> prov=%d al=[%d,%d,%d,%d,%d,%d]\r\n",
+               g_plt_use_pl ? "PL" : "PS",
                g_plt_count, prov, al[0], al[1], al[2], al[3], al[4], al[5]);
 }
 
@@ -1608,6 +1738,12 @@ int main(void) {
     xil_printf("\r\n===========================================\r\n");
     xil_printf("  FZ3A Phase 2b: Network image -> DP display\r\n");
     xil_printf("===========================================\r\n");
+
+    /* EARLY PL PROBE — test AXI-Lite to plate_cnn_hls before anything else */
+    xil_printf("[EARLY] reading plate_cnn AP_CTRL @ 0x%08lx...\r\n", (unsigned long)PLT_CNN_BASE);
+    volatile uint32_t early = PLT_CNN_AP_CTRL;
+    xil_printf("[EARLY] AP_CTRL = 0x%08x (expect 0x4 = ap_idle)\r\n", early);
+    xil_printf("[EARLY] PL probe SURVIVED, continuing boot\r\n");
 
     /* 1. Fill BOTH framebuffers with the "waiting" pattern so whichever
      *    DPDMA reads first, we see the pattern.  Buffer-1 will get
