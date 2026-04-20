@@ -1973,8 +1973,8 @@ static int find_plate_rects(const uint8_t *edge, int W, int H, rect_t out[], int
     const int CELL = 8;
     const int GW = W / CELL, GH = H / CELL;
     if (GW > 160 || GH > 90) return 0;
-    static uint32_t dens_sum[90][160];  /* edge sum per cell (score) */
-    static uint8_t dens[90][160];       /* binary mask */
+    static uint32_t dens_sum[90][160];
+    static uint8_t dens[90][160];
     for (int gy = 0; gy < GH; gy++) {
         for (int gx = 0; gx < GW; gx++) {
             uint32_t s = 0;
@@ -1987,7 +1987,6 @@ static int find_plate_rects(const uint8_t *edge, int W, int H, rect_t out[], int
             dens[gy][gx] = avg > 80 ? 1 : 0;
         }
     }
-    /* Collect ALL candidates with score */
     static ranked_rect_t cand[64];
     int ncand = 0;
     int gy_start = GH * 30 / 100;
@@ -2005,11 +2004,11 @@ static int find_plate_rects(const uint8_t *edge, int W, int H, rect_t out[], int
                         if (dens[gy+1][j]) next++;
                         score += dens_sum[gy][j] + dens_sum[gy+1][j];
                     }
-                    if (next >= run/2 && ncand < 64) {
+                    if (next >= run/3 && ncand < 64) {  /* relaxed from run/2 */
                         cand[ncand].r.x = x0 * CELL;
                         cand[ncand].r.y = gy * CELL;
                         cand[ncand].r.w = run * CELL;
-                        cand[ncand].r.h = 2 * CELL;  /* initial, will refine */
+                        cand[ncand].r.h = 2 * CELL;
                         cand[ncand].score = score;
                         ncand++;
                     }
@@ -2019,7 +2018,7 @@ static int find_plate_rects(const uint8_t *edge, int W, int H, rect_t out[], int
         }
     }
     /* Sort by score desc (selection sort, small N) */
-    for (int i = 0; i < ncand-1 && i < max_out; i++) {
+    for (int i = 0; i < ncand-1 && i < 64; i++) {
         int best = i;
         for (int j = i+1; j < ncand; j++)
             if (cand[j].score > cand[best].score) best = j;
@@ -2027,18 +2026,41 @@ static int find_plate_rects(const uint8_t *edge, int W, int H, rect_t out[], int
             ranked_rect_t tmp = cand[i]; cand[i] = cand[best]; cand[best] = tmp;
         }
     }
-    /* Refine top candidates and emit. V-refine only (H-refine was buggy).
-     * Emit 2 variants per candidate: tight + slightly expanded. */
-    int n = 0;
-    for (int i = 0; i < ncand && n < max_out; i++) {
+    /* Refine + NMS-dedupe (greedy IoU > 0.5) → unique regions; then emit
+     * 3 variants per unique region (tight + 3px + 6px expand). Frees CNN
+     * slots that previously went to overlapping near-duplicate candidates. */
+    rect_t unique[16];
+    int n_unique = 0;
+    for (int i = 0; i < ncand && n_unique < 16; i++) {
         rect_t base = cand[i].r;
         refine_bbox_vertical(edge, W, H, &base);
         int w = base.w, h = base.h;
         if (h <= 0 || w <= 0) continue;
-        if (w < 2*h || w > 7*h) continue;
-        if (n < max_out) out[n++] = base;
-        /* Expanded variant: +3px all sides */
-        if (n < max_out) {
+        if (w < 2*h || w > 7*h) continue;  /* 2:1 to 7:1 */
+        /* NMS: skip if IoU > 0.5 with any kept rect */
+        int dup = 0;
+        for (int j = 0; j < n_unique; j++) {
+            rect_t a = base, b = unique[j];
+            int ix1 = a.x > b.x ? a.x : b.x;
+            int iy1 = a.y > b.y ? a.y : b.y;
+            int ix2 = (a.x+a.w) < (b.x+b.w) ? (a.x+a.w) : (b.x+b.w);
+            int iy2 = (a.y+a.h) < (b.y+b.h) ? (a.y+a.h) : (b.y+b.h);
+            int iw = ix2 > ix1 ? ix2 - ix1 : 0;
+            int ih = iy2 > iy1 ? iy2 - iy1 : 0;
+            int inter = iw * ih;
+            int uni = a.w*a.h + b.w*b.h - inter;
+            if (uni > 0 && (inter * 2) > uni) { dup = 1; break; }  /* IoU > 0.5 */
+        }
+        if (!dup) unique[n_unique++] = base;
+    }
+    /* Emit 3 variants per unique region */
+    int n = 0;
+    for (int i = 0; i < n_unique && n + 2 < max_out; i++) {
+        rect_t base = unique[i];
+        /* Variant 0: tight */
+        out[n++] = base;
+        /* Variant 1: +3px all sides */
+        {
             rect_t e = base;
             e.x = (e.x >= 3) ? e.x - 3 : 0;
             e.y = (e.y >= 3) ? e.y - 3 : 0;
@@ -2046,22 +2068,60 @@ static int find_plate_rects(const uint8_t *edge, int W, int H, rect_t out[], int
             e.h = (e.y + e.h + 6 <= H) ? e.h + 6 : H - e.y;
             out[n++] = e;
         }
+        /* Variant 2: +6px all sides */
+        {
+            rect_t e2 = base;
+            e2.x = (e2.x >= 6) ? e2.x - 6 : 0;
+            e2.y = (e2.y >= 6) ? e2.y - 6 : 0;
+            e2.w = (e2.x + e2.w + 12 <= W) ? e2.w + 12 : W - e2.x;
+            e2.h = (e2.y + e2.h + 12 <= H) ? e2.h + 12 : H - e2.y;
+            out[n++] = e2;
+        }
     }
     return n;
 }
 
 /* Crop + resize grayscale image patch to 128x32 for plate CNN. */
+/* Bilinear crop+resize to 128x32 (matches PIL.Image BILINEAR).
+ * PIL formula: src_x = (dst_x + 0.5) * (src_w / dst_w) - 0.5
+ * Q16 fixed point: rx = bw*65536/128 = bw*512 */
 static void crop_resize_128x32(const uint8_t *src, int W, int H,
                                 int x0, int y0, int bw, int bh,
                                 uint8_t *dst_128x32) {
     if (bw <= 0 || bh <= 0) { memset(dst_128x32, 0, 128*32); return; }
+    int32_t rx = (bw * 65536) / 128;
+    int32_t ry = (bh * 65536) / 32;
+    int32_t half = 32768;
     for (int dy = 0; dy < 32; dy++) {
-        int sy = y0 + (dy * bh) / 32;
-        if (sy < 0) sy = 0; if (sy >= H) sy = H-1;
+        /* sy_q16 = y0<<16 + dy*ry + ry/2 - half (in Q16) */
+        int32_t sy_q16 = (y0 << 16) + dy * ry + (ry >> 1) - half;
+        if (sy_q16 < 0) sy_q16 = 0;
+        int sy = sy_q16 >> 16;
+        int fy = sy_q16 & 0xFFFF;
+        int sy1 = sy + 1;
+        if (sy >= H) sy = H-1;
+        if (sy1 >= H) sy1 = H-1;
+        int wy1 = fy >> 8;
+        int wy0 = 256 - wy1;
         for (int dx = 0; dx < 128; dx++) {
-            int sx = x0 + (dx * bw) / 128;
-            if (sx < 0) sx = 0; if (sx >= W) sx = W-1;
-            dst_128x32[dy*128 + dx] = src[sy*W + sx];
+            int32_t sx_q16 = (x0 << 16) + dx * rx + (rx >> 1) - half;
+            if (sx_q16 < 0) sx_q16 = 0;
+            int sx = sx_q16 >> 16;
+            int fx = sx_q16 & 0xFFFF;
+            int sx1 = sx + 1;
+            if (sx >= W) sx = W-1;
+            if (sx1 >= W) sx1 = W-1;
+            int wx1 = fx >> 8;
+            int wx0 = 256 - wx1;
+            int p00 = src[sy *W + sx ];
+            int p01 = src[sy *W + sx1];
+            int p10 = src[sy1*W + sx ];
+            int p11 = src[sy1*W + sx1];
+            int top = (p00*wx0 + p01*wx1) >> 8;
+            int bot = (p10*wx0 + p11*wx1) >> 8;
+            int v = (top*wy0 + bot*wy1) >> 8;
+            if (v < 0) v = 0; if (v > 255) v = 255;
+            dst_128x32[dy*128 + dx] = (uint8_t)v;
         }
     }
 }
@@ -2094,10 +2154,13 @@ static void all_run_and_reply(struct tcp_pcb *tpcb) {
     int n_rects = find_plate_rects(ALL_EDGE_BUF, W, H, rects, ALL_MAX_PLATES);
     xil_printf("[all]  %d plate rects\r\n", n_rects);
 
-    /* Step 3: Run each candidate through PL plate_cnn */
+    /* Step 3: Run each variant through PL plate_cnn, emit each as a plate
+     * result. find_plate_rects already NMS-deduplicates candidates so each
+     * variant is on a distinct region; client treats them as candidate set. */
     uint8_t plate_results[ALL_MAX_PLATES][7];  /* prov + 6 al */
+    rect_t plate_rects[ALL_MAX_PLATES];
     int n_plates = 0;
-    for (int i = 0; i < n_rects; i++) {
+    for (int i = 0; i < n_rects && n_plates < ALL_MAX_PLATES; i++) {
         uint8_t patch[PCN_PLATE_BYTES];
         crop_resize_128x32(ALL_SRC_BUF, W, H,
                            rects[i].x, rects[i].y, rects[i].w, rects[i].h, patch);
@@ -2108,8 +2171,9 @@ static void all_run_and_reply(struct tcp_pcb *tpcb) {
         } else {
             pcn_infer(patch, &prov, al);
         }
-        plate_results[i][0] = prov;
-        for (int j = 0; j < 6; j++) plate_results[i][j+1] = al[j];
+        plate_results[n_plates][0] = prov;
+        for (int j = 0; j < 6; j++) plate_results[n_plates][j+1] = al[j];
+        plate_rects[n_plates] = rects[i];
         n_plates++;
     }
 
@@ -2126,8 +2190,8 @@ static void all_run_and_reply(struct tcp_pcb *tpcb) {
     rep[off++]='R'; rep[off++]='E'; rep[off++]='S'; rep[off++]=0;
     rep[off++] = (uint8_t)n_plates;
     for (int i = 0; i < n_plates; i++) {
-        uint16_t x = (uint16_t)rects[i].x, y = (uint16_t)rects[i].y;
-        uint16_t w = (uint16_t)rects[i].w, h = (uint16_t)rects[i].h;
+        uint16_t x = (uint16_t)plate_rects[i].x, y = (uint16_t)plate_rects[i].y;
+        uint16_t w = (uint16_t)plate_rects[i].w, h = (uint16_t)plate_rects[i].h;
         memcpy(&rep[off], &x, 2); off+=2;
         memcpy(&rep[off], &y, 2); off+=2;
         memcpy(&rep[off], &w, 2); off+=2;
