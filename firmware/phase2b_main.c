@@ -65,15 +65,16 @@ static const char *infer_mode_name[] = {
 };
 
 /* PED mode selector: 0=HOG+SVM PL, 1=Pixel+SVM PS, 2=Pixel+NB PS, 3=Template PS */
-#define NUM_PED_MODES 4
-static volatile int g_ped_mode = 0;
+#define NUM_PED_MODES 5  /* 0:HOG+SVM PL, 1-3:PS sw, 4:PEDCNN PL sliding window */
+static volatile int g_ped_mode = 4;  /* 4 = PEDCNN PL sliding window (v18 bitstream) */
 
 /* Forward decls for V key toggle */
 static volatile int g_plt_use_pl;
 static int g_plt_pl_inited;
 static void plt_cnn_init_pl(void);
 static const char *ped_mode_name[] = {
-    "HOG+SVM (PL)", "Pixel+SVM (PS)", "Pixel+NB (PS)", "Template (PS)"
+    "HOG+SVM (PL)", "Pixel+SVM (PS)", "Pixel+NB (PS)", "Template (PS)",
+    "PEDCNN (PL sliding)"
 };
 
 /* ========== CNN TinyLeNet HLS accelerator MMIO ========== */
@@ -182,7 +183,7 @@ static void mnist_infer_cnn(const uint8_t img[784], uint8_t *pred_out,
 
 /* ========== Video Filter HLS accelerator MMIO ========== */
 #ifndef FLT_HLS_BASE
-#define FLT_HLS_BASE     0xA0030000UL  /* Vivado: /filter_hls/s_axi_ctrl */
+#define FLT_HLS_BASE     0xA0020000UL  /* v19: /filter_hls @ A0020000 */
 #endif
 #define FLT_AP_CTRL       (*(volatile uint32_t*)(FLT_HLS_BASE + 0x00))
 #define FLT_SRC_LO        (*(volatile uint32_t*)(FLT_HLS_BASE + 0x10))
@@ -1177,8 +1178,9 @@ static void start_mnist_server(void) {
 #define PED_IMG_SIZE (PED_IMG_W * PED_IMG_H)  /* 76800 */
 #define PED_MAX_DETS 16
 
+/* Legacy HOG+SVM PED (ped_hls, NOT in v18 bitstream) */
 #ifndef PED_BASE
-#define PED_BASE       0xA0020000UL  /* Vivado hwh: /ped_hls HIGHVALUE=0xA002FFFF */
+#define PED_BASE       0xA0020000UL  /* legacy HOG+SVM - only for old bitstreams */
 #endif
 #define PED_AP_CTRL       (*(volatile uint32_t*)(PED_BASE + 0x00))
 #define PED_IMAGE_ADDR_LO (*(volatile uint32_t*)(PED_BASE + 0x10))
@@ -1189,6 +1191,17 @@ static void start_mnist_server(void) {
 #define PED_AP_START (1U << 0)
 #define PED_AP_DONE  (1U << 1)
 #define PED_AP_IDLE  (1U << 2)
+
+/* PEDCNN slim (v18 bitstream, pedcnn_hls_ip @ 0xA0010000)
+ * 64x128 binary pedestrian classifier. PS does sliding windows.
+ * Regs: 0x00 AP_CTRL, 0x10/14 scores[2] (no/yes), 0x18 pred_out, 0x2000 image */
+#define PEDCNN_BASE       0xA0010000UL
+#define PEDCNN_AP_CTRL    (*(volatile uint32_t*)(PEDCNN_BASE + 0x0000))
+#define PEDCNN_SCORE_NO   (*(volatile int32_t*) (PEDCNN_BASE + 0x0010))
+#define PEDCNN_SCORE_YES  (*(volatile int32_t*) (PEDCNN_BASE + 0x0014))
+#define PEDCNN_PRED       (*(volatile uint32_t*)(PEDCNN_BASE + 0x0018))
+#define PEDCNN_IMG        ((volatile uint8_t *)(PEDCNN_BASE + 0x2000))
+#define PEDCNN_PATCH_SIZE 8192  /* 64*128 */
 
 /* DDR buffer for PED image - use address after framebuffers (0x10800000+) */
 #define PED_DDR_BUF_ADDR  0x10800000UL
@@ -1253,12 +1266,142 @@ static int ped_infer_template(const uint8_t patch[8192], int32_t *score_out) {
     return (acc > 0) ? 1 : 0;
 }
 
+/* PEDCNN slim: run single 64x128 patch through PL classifier.
+ * Returns 1 if pedestrian detected, 0 otherwise. Writes score to *score_out. */
+static int pedcnn_run_patch(const uint8_t patch[PEDCNN_PATCH_SIZE], int32_t *score_out) {
+    /* Wait idle (drain residual ap_done) */
+    (void)PEDCNN_AP_CTRL;
+    for (volatile uint32_t w = 0; w < 600000000U; w++) {
+        if (PEDCNN_AP_CTRL & (1U << 2)) break;  /* ap_idle */
+    }
+    /* Write patch 32-bit at a time */
+    volatile uint32_t *dst32 = (volatile uint32_t *)PEDCNN_IMG;
+    const uint32_t *src32 = (const uint32_t *)patch;
+    for (int i = 0; i < PEDCNN_PATCH_SIZE/4; i++) dst32[i] = src32[i];
+    /* Trigger */
+    PEDCNN_AP_CTRL = 1U;  /* ap_start */
+    /* Poll done */
+    for (volatile uint32_t t = 0; t < 600000000U; t++) {
+        if (PEDCNN_AP_CTRL & (1U << 1)) break;  /* ap_done */
+    }
+    int32_t s_yes = PEDCNN_SCORE_YES;
+    int32_t s_no  = PEDCNN_SCORE_NO;
+    *score_out = s_yes - s_no;
+    return (s_yes > s_no) ? 1 : 0;
+}
+
+/* PEDCNN sliding window with Sobel-density pre-filtering.
+ * Step 24 + only dense cells → ~10-30 windows instead of 136.
+ * 320-64=256 step 24 → 11 x pos; 240-128=112 step 24 → 5 y pos → max 55. */
+#define PEDCNN_STEP 24
+#define PEDCNN_DENSITY_THRESH 30  /* avg Sobel magnitude threshold */
+
+/* Quick PS Sobel on a single 64x128 patch (count strong edges). */
+static uint32_t patch_edge_density(const uint8_t *src, int W, int x0, int y0) {
+    uint32_t sum = 0;
+    /* Sparse sample Sobel |dx|+|dy| at grid points to save time */
+    for (int dy = 8; dy < 128; dy += 8) {
+        const uint8_t *r0 = &src[(y0+dy-1)*W];
+        const uint8_t *r1 = &src[(y0+dy  )*W];
+        const uint8_t *r2 = &src[(y0+dy+1)*W];
+        for (int dx = 8; dx < 64; dx += 4) {
+            int gx = -(int)r0[x0+dx-1] - 2*(int)r1[x0+dx-1] - (int)r2[x0+dx-1]
+                    + (int)r0[x0+dx+1] + 2*(int)r1[x0+dx+1] + (int)r2[x0+dx+1];
+            int gy =  (int)r0[x0+dx-1] + 2*(int)r0[x0+dx] + (int)r0[x0+dx+1]
+                    - (int)r2[x0+dx-1] - 2*(int)r2[x0+dx] - (int)r2[x0+dx+1];
+            sum += (gx<0?-gx:gx) + (gy<0?-gy:gy);
+        }
+    }
+    /* Samples: 15 y × 14 x = 210, normalize */
+    return sum / 210;
+}
+
+/* IoU×10000 between two 64x128 boxes given by top-left (x,y). */
+static int box_iou_x10k(int ax, int ay, int bx, int by) {
+    const int W = 64, H = 128;
+    int ix1 = (ax > bx) ? ax : bx;
+    int iy1 = (ay > by) ? ay : by;
+    int ix2 = ((ax+W) < (bx+W)) ? (ax+W) : (bx+W);
+    int iy2 = ((ay+H) < (by+H)) ? (ay+H) : (by+H);
+    int iw = ix2 - ix1; if (iw < 0) iw = 0;
+    int ih = iy2 - iy1; if (ih < 0) ih = 0;
+    int inter = iw * ih;
+    int area = W * H;
+    int uni = 2 * area - inter;
+    if (uni <= 0) return 0;
+    return (inter * 10000) / uni;
+}
+
+static int pedcnn_sliding(const uint8_t *src320x240, int32_t dets_pos[],
+                          int32_t dets_score[], int max_dets) {
+    static uint8_t patch[PEDCNN_PATCH_SIZE];
+    /* Collect raw detections in larger scratch (up to 40) */
+    int32_t raw_pos[40]; int32_t raw_score[40];
+    int raw_n = 0;
+    int n_sobel_skip = 0, n_sent = 0;
+    for (int y = 0; y + 128 <= 240; y += PEDCNN_STEP) {
+        for (int x = 0; x + 64 <= 320; x += PEDCNN_STEP) {
+            uint32_t d = patch_edge_density(src320x240, 320, x, y);
+            if (d < PEDCNN_DENSITY_THRESH) { n_sobel_skip++; continue; }
+            for (int dy = 0; dy < 128; dy++) {
+                const uint8_t *src_row = &src320x240[(y + dy) * 320 + x];
+                uint8_t *dst_row = &patch[dy * 64];
+                for (int dx = 0; dx < 64; dx++) dst_row[dx] = src_row[dx];
+            }
+            int32_t score;
+            int is_ped = pedcnn_run_patch(patch, &score);
+            n_sent++;
+            if (is_ped && raw_n < 40) {
+                raw_pos[raw_n] = ((int32_t)x << 16) | (int32_t)y;
+                raw_score[raw_n] = score;
+                raw_n++;
+            }
+        }
+    }
+
+    /* NMS: sort by score desc, suppress overlaps IoU > 0.3 */
+    int suppressed[40] = {0};
+    /* Simple selection-sort-like NMS */
+    int n = 0;
+    while (n < max_dets) {
+        int best_i = -1; int32_t best_score = -1;
+        for (int i = 0; i < raw_n; i++) {
+            if (suppressed[i]) continue;
+            if (raw_score[i] > best_score) { best_score = raw_score[i]; best_i = i; }
+        }
+        if (best_i < 0) break;
+        dets_pos[n] = raw_pos[best_i];
+        dets_score[n] = raw_score[best_i];
+        n++;
+        suppressed[best_i] = 1;
+        /* Suppress overlapping boxes */
+        int bx = (raw_pos[best_i] >> 16) & 0xFFFF;
+        int by = raw_pos[best_i] & 0xFFFF;
+        for (int j = 0; j < raw_n; j++) {
+            if (suppressed[j]) continue;
+            int cx = (raw_pos[j] >> 16) & 0xFFFF;
+            int cy = raw_pos[j] & 0xFFFF;
+            if (box_iou_x10k(bx, by, cx, cy) > 3000) { /* IoU > 0.3 */
+                suppressed[j] = 1;
+            }
+        }
+    }
+    xil_printf("[pedcnn] skipped %d, sent %d, raw %d, nms %d\r\n",
+               n_sobel_skip, n_sent, raw_n, n);
+    return n;
+}
+
 static void ped_run_and_reply(struct tcp_pcb *tpcb) {
     int n_dets;
     int32_t pos_det = 0;
     int32_t score_det = 0;
+    static int32_t pedcnn_dets_pos[PED_MAX_DETS];
+    static int32_t pedcnn_dets_score[PED_MAX_DETS];
 
-    if (g_ped_mode == 0) {
+    if (g_ped_mode == 4) {
+        /* PEDCNN PL sliding window */
+        n_dets = pedcnn_sliding(g_ped_buf, pedcnn_dets_pos, pedcnn_dets_score, PED_MAX_DETS);
+    } else if (g_ped_mode == 0) {
         /* HOG+SVM PL (original path) */
         memcpy(PED_DDR_BUF, g_ped_buf, PED_IMG_SIZE);
         Xil_DCacheFlushRange((INTPTR)PED_DDR_BUF, PED_IMG_SIZE);
@@ -1300,6 +1443,11 @@ static void ped_run_and_reply(struct tcp_pcb *tpcb) {
             int32_t score = PED_DET(i * 2 + 1);
             memcpy(&rep[8 + i * 8], &pos, 4);
             memcpy(&rep[8 + i * 8 + 4], &score, 4);
+        }
+    } else if (g_ped_mode == 4) {
+        for (int i = 0; i < n_dets; i++) {
+            memcpy(&rep[8 + i * 8], &pedcnn_dets_pos[i], 4);
+            memcpy(&rep[8 + i * 8 + 4], &pedcnn_dets_score[i], 4);
         }
     } else if (n_dets > 0) {
         memcpy(&rep[8], &pos_det, 4);
@@ -1705,6 +1853,373 @@ static void start_plt_server(void) {
     xil_printf("      reply:    PRD\\0 + prov(1) + al[6]\r\n");
 }
 
+/* ============================================================
+ *  Port 5004: Full-scene server (PS-side Sobel + plate localize
+ *             + PL plate_cnn + PL pedcnn, all on-board)
+ *  Input : "ALL\0" + w(4) + h(4) + fmt(4) + w*h bytes grayscale
+ *  Output: "RES\0" + n_plates(1) + per plate { x(2) y(2) w(2) h(2) prov(1) al[6] }
+ *          + n_peds(1) + per ped { x(2) y(2) w(2) h(2) score(4) }
+ * ============================================================ */
+#define ALL_MAX_W 1280
+#define ALL_MAX_H 720
+#define ALL_HDR_BYTES 16
+#define ALL_MAX_PLATES 32
+#define ALL_MAX_PEDS 16
+
+/* Large DDR scratch buffers (placed after FB + PED + FLT regions) */
+#define ALL_SRC_ADDR 0x11400000UL   /* 1280x720 = 921KB grayscale */
+#define ALL_EDGE_ADDR 0x11500000UL  /* 1280x720 Sobel out */
+#define ALL_SRC_BUF ((uint8_t *)ALL_SRC_ADDR)
+#define ALL_EDGE_BUF ((uint8_t *)ALL_EDGE_ADDR)
+
+typedef struct { int x, y, w, h; } rect_t;
+
+typedef enum { AL_HDR, AL_DATA } all_state_t;
+static all_state_t g_all_state = AL_HDR;
+static uint8_t g_all_hdr[ALL_HDR_BYTES];
+static uint32_t g_all_hdr_got = 0;
+static uint32_t g_all_got = 0;
+static uint32_t g_all_w = 0, g_all_h = 0, g_all_total = 0;
+static uint32_t g_all_count = 0;
+
+/* PS-side Sobel edge detection on grayscale image (in-place → ALL_EDGE_BUF).
+ * Simple 3x3 Sobel, output |Gx|+|Gy| clamped to 255. */
+static void sobel_ps(const uint8_t *src, uint8_t *dst, int W, int H) {
+    /* zero borders */
+    for (int x = 0; x < W; x++) { dst[x] = 0; dst[(H-1)*W + x] = 0; }
+    for (int y = 1; y < H-1; y++) { dst[y*W] = 0; dst[y*W+W-1] = 0; }
+    for (int y = 1; y < H-1; y++) {
+        const uint8_t *r0 = src + (y-1)*W;
+        const uint8_t *r1 = src + y*W;
+        const uint8_t *r2 = src + (y+1)*W;
+        uint8_t *out = dst + y*W;
+        for (int x = 1; x < W-1; x++) {
+            int gx = -(int)r0[x-1] - 2*(int)r1[x-1] - (int)r2[x-1]
+                    + (int)r0[x+1] + 2*(int)r1[x+1] + (int)r2[x+1];
+            int gy =  (int)r0[x-1] + 2*(int)r0[x] + (int)r0[x+1]
+                    - (int)r2[x-1] - 2*(int)r2[x] - (int)r2[x+1];
+            int m = (gx<0?-gx:gx) + (gy<0?-gy:gy);
+            if (m > 255) m = 255;
+            out[x] = (uint8_t)m;
+        }
+    }
+}
+
+/* Find plate-like rectangles from edge map.
+ * Strategy: scan horizontal rows for high-edge-density runs, group adjacent
+ * rows, filter by aspect ratio 3:1-6:1. */
+/* Pixel-precision vertical bbox refinement. */
+static void refine_bbox_vertical(const uint8_t *edge, int W, int H, rect_t *r) {
+    int yc = r->y + r->h/2;
+    int x1 = r->x, x2 = r->x + r->w;
+    if (x1 < 0) x1 = 0; if (x2 > W) x2 = W;
+    int center_row_sum = 0;
+    for (int x = x1; x < x2; x++) center_row_sum += edge[yc*W + x];
+    int row_avg = center_row_sum / (x2 - x1);
+    int THR = row_avg / 2;
+    if (THR < 20) THR = 20;
+    int top = yc;
+    for (int y = yc - 1; y >= 0 && y > yc - 40; y--) {
+        int sum = 0;
+        for (int x = x1; x < x2; x++) sum += edge[y*W + x];
+        if (sum / (x2 - x1) < THR) break;
+        top = y;
+    }
+    int bot = yc;
+    for (int y = yc + 1; y < H && y < yc + 40; y++) {
+        int sum = 0;
+        for (int x = x1; x < x2; x++) sum += edge[y*W + x];
+        if (sum / (x2 - x1) < THR) break;
+        bot = y;
+    }
+    r->y = top;
+    r->h = bot - top + 1;
+    if (r->h < 10) r->h = 10;
+}
+
+/* Pixel-precision horizontal bbox refinement: shrink/expand x1,x2 where
+ * column edge energy drops. */
+static void refine_bbox_horizontal(const uint8_t *edge, int W, int H, rect_t *r) {
+    int y1 = r->y, y2 = r->y + r->h;
+    if (y1 < 0) y1 = 0; if (y2 > H) y2 = H;
+    int xc = r->x + r->w/2;
+    int col_sum_center = 0;
+    for (int y = y1; y < y2; y++) col_sum_center += edge[y*W + xc];
+    int col_avg = col_sum_center / (y2 - y1);
+    int THR = col_avg / 3;
+    if (THR < 15) THR = 15;
+    int left = xc;
+    for (int x = xc - 1; x >= 0 && x > xc - 100; x--) {
+        int sum = 0;
+        for (int y = y1; y < y2; y++) sum += edge[y*W + x];
+        if (sum / (y2 - y1) < THR) break;
+        left = x;
+    }
+    int right = xc;
+    for (int x = xc + 1; x < W && x < xc + 100; x++) {
+        int sum = 0;
+        for (int y = y1; y < y2; y++) sum += edge[y*W + x];
+        if (sum / (y2 - y1) < THR) break;
+        right = x;
+    }
+    r->x = left;
+    r->w = right - left + 1;
+    if (r->w < 20) r->w = 20;
+}
+
+typedef struct { rect_t r; uint32_t score; } ranked_rect_t;
+
+static int find_plate_rects(const uint8_t *edge, int W, int H, rect_t out[], int max_out) {
+    const int CELL = 8;
+    const int GW = W / CELL, GH = H / CELL;
+    if (GW > 160 || GH > 90) return 0;
+    static uint32_t dens_sum[90][160];  /* edge sum per cell (score) */
+    static uint8_t dens[90][160];       /* binary mask */
+    for (int gy = 0; gy < GH; gy++) {
+        for (int gx = 0; gx < GW; gx++) {
+            uint32_t s = 0;
+            for (int dy = 0; dy < CELL; dy++) {
+                const uint8_t *row = edge + (gy*CELL+dy)*W + gx*CELL;
+                for (int dx = 0; dx < CELL; dx++) s += row[dx];
+            }
+            uint32_t avg = s / (CELL*CELL);
+            dens_sum[gy][gx] = avg;
+            dens[gy][gx] = avg > 80 ? 1 : 0;
+        }
+    }
+    /* Collect ALL candidates with score */
+    static ranked_rect_t cand[64];
+    int ncand = 0;
+    int gy_start = GH * 30 / 100;
+    int gy_end = GH * 90 / 100;
+    for (int gy = gy_start; gy + 1 < gy_end && ncand < 64; gy++) {
+        int x0 = -1;
+        for (int gx = 0; gx <= GW; gx++) {
+            int cur = (gx < GW) && dens[gy][gx];
+            if (cur && x0 < 0) x0 = gx;
+            else if ((!cur || gx == GW) && x0 >= 0) {
+                int run = gx - x0;
+                if (run >= 6 && run <= 30) {
+                    int next = 0; uint32_t score = 0;
+                    for (int j = x0; j < gx; j++) {
+                        if (dens[gy+1][j]) next++;
+                        score += dens_sum[gy][j] + dens_sum[gy+1][j];
+                    }
+                    if (next >= run/2 && ncand < 64) {
+                        cand[ncand].r.x = x0 * CELL;
+                        cand[ncand].r.y = gy * CELL;
+                        cand[ncand].r.w = run * CELL;
+                        cand[ncand].r.h = 2 * CELL;  /* initial, will refine */
+                        cand[ncand].score = score;
+                        ncand++;
+                    }
+                }
+                x0 = -1;
+            }
+        }
+    }
+    /* Sort by score desc (selection sort, small N) */
+    for (int i = 0; i < ncand-1 && i < max_out; i++) {
+        int best = i;
+        for (int j = i+1; j < ncand; j++)
+            if (cand[j].score > cand[best].score) best = j;
+        if (best != i) {
+            ranked_rect_t tmp = cand[i]; cand[i] = cand[best]; cand[best] = tmp;
+        }
+    }
+    /* Refine top candidates and emit. V-refine only (H-refine was buggy).
+     * Emit 2 variants per candidate: tight + slightly expanded. */
+    int n = 0;
+    for (int i = 0; i < ncand && n < max_out; i++) {
+        rect_t base = cand[i].r;
+        refine_bbox_vertical(edge, W, H, &base);
+        int w = base.w, h = base.h;
+        if (h <= 0 || w <= 0) continue;
+        if (w < 2*h || w > 7*h) continue;
+        if (n < max_out) out[n++] = base;
+        /* Expanded variant: +3px all sides */
+        if (n < max_out) {
+            rect_t e = base;
+            e.x = (e.x >= 3) ? e.x - 3 : 0;
+            e.y = (e.y >= 3) ? e.y - 3 : 0;
+            e.w = (e.x + e.w + 6 <= W) ? e.w + 6 : W - e.x;
+            e.h = (e.y + e.h + 6 <= H) ? e.h + 6 : H - e.y;
+            out[n++] = e;
+        }
+    }
+    return n;
+}
+
+/* Crop + resize grayscale image patch to 128x32 for plate CNN. */
+static void crop_resize_128x32(const uint8_t *src, int W, int H,
+                                int x0, int y0, int bw, int bh,
+                                uint8_t *dst_128x32) {
+    if (bw <= 0 || bh <= 0) { memset(dst_128x32, 0, 128*32); return; }
+    for (int dy = 0; dy < 32; dy++) {
+        int sy = y0 + (dy * bh) / 32;
+        if (sy < 0) sy = 0; if (sy >= H) sy = H-1;
+        for (int dx = 0; dx < 128; dx++) {
+            int sx = x0 + (dx * bw) / 128;
+            if (sx < 0) sx = 0; if (sx >= W) sx = W-1;
+            dst_128x32[dy*128 + dx] = src[sy*W + sx];
+        }
+    }
+}
+
+/* Downsample src (W,H) gray → 320x240 for PED CNN. */
+static void downsample_320x240(const uint8_t *src, int W, int H, uint8_t *dst) {
+    for (int y = 0; y < 240; y++) {
+        int sy = (y * H) / 240;
+        for (int x = 0; x < 320; x++) {
+            int sx = (x * W) / 320;
+            dst[y*320 + x] = src[sy*W + sx];
+        }
+    }
+}
+
+static void all_run_and_reply(struct tcp_pcb *tpcb) {
+    int W = (int)g_all_w, H = (int)g_all_h;
+    if (W <= 0 || W > ALL_MAX_W || H <= 0 || H > ALL_MAX_H) {
+        xil_printf("[all] bad dims %dx%d\r\n", W, H);
+        return;
+    }
+    xil_printf("[all] #%d: %dx%d begin\r\n", ++g_all_count, W, H);
+
+    /* Step 1: Sobel edge detection (PS software) */
+    sobel_ps(ALL_SRC_BUF, ALL_EDGE_BUF, W, H);
+    xil_printf("[all]  sobel done\r\n");
+
+    /* Step 2: Find plate candidate rectangles */
+    rect_t rects[ALL_MAX_PLATES];
+    int n_rects = find_plate_rects(ALL_EDGE_BUF, W, H, rects, ALL_MAX_PLATES);
+    xil_printf("[all]  %d plate rects\r\n", n_rects);
+
+    /* Step 3: Run each candidate through PL plate_cnn */
+    uint8_t plate_results[ALL_MAX_PLATES][7];  /* prov + 6 al */
+    int n_plates = 0;
+    for (int i = 0; i < n_rects; i++) {
+        uint8_t patch[PCN_PLATE_BYTES];
+        crop_resize_128x32(ALL_SRC_BUF, W, H,
+                           rects[i].x, rects[i].y, rects[i].w, rects[i].h, patch);
+        uint8_t prov; uint8_t al[6];
+        if (g_plt_use_pl) {
+            if (!g_plt_pl_inited) plt_cnn_init_pl();
+            plt_cnn_run_pl(patch, &prov, al);
+        } else {
+            pcn_infer(patch, &prov, al);
+        }
+        plate_results[i][0] = prov;
+        for (int j = 0; j < 6; j++) plate_results[i][j+1] = al[j];
+        n_plates++;
+    }
+
+    /* Step 4: Downsample + PED CNN sliding windows (PL) */
+    static uint8_t ped_small[320*240];
+    downsample_320x240(ALL_SRC_BUF, W, H, ped_small);
+    int32_t ped_pos[ALL_MAX_PEDS], ped_score[ALL_MAX_PEDS];
+    int n_peds = pedcnn_sliding(ped_small, ped_pos, ped_score, ALL_MAX_PEDS);
+    xil_printf("[all]  %d peds\r\n", n_peds);
+
+    /* Step 5: Serialize reply (32 plates * 15 + 16 peds * 12 + 6 header = 702 max) */
+    uint8_t rep[1024];
+    int off = 0;
+    rep[off++]='R'; rep[off++]='E'; rep[off++]='S'; rep[off++]=0;
+    rep[off++] = (uint8_t)n_plates;
+    for (int i = 0; i < n_plates; i++) {
+        uint16_t x = (uint16_t)rects[i].x, y = (uint16_t)rects[i].y;
+        uint16_t w = (uint16_t)rects[i].w, h = (uint16_t)rects[i].h;
+        memcpy(&rep[off], &x, 2); off+=2;
+        memcpy(&rep[off], &y, 2); off+=2;
+        memcpy(&rep[off], &w, 2); off+=2;
+        memcpy(&rep[off], &h, 2); off+=2;
+        for (int j = 0; j < 7; j++) rep[off++] = plate_results[i][j];
+    }
+    rep[off++] = (uint8_t)n_peds;
+    for (int i = 0; i < n_peds; i++) {
+        /* Scale ped coords from 320x240 to original W,H */
+        int32_t pos = ped_pos[i];
+        int px = (pos >> 16) & 0xFFFF, py = pos & 0xFFFF;
+        uint16_t x = (uint16_t)(px * W / 320);
+        uint16_t y = (uint16_t)(py * H / 240);
+        uint16_t w = (uint16_t)(64 * W / 320);
+        uint16_t h = (uint16_t)(128 * H / 240);
+        int32_t sc = ped_score[i];
+        memcpy(&rep[off], &x, 2); off+=2;
+        memcpy(&rep[off], &y, 2); off+=2;
+        memcpy(&rep[off], &w, 2); off+=2;
+        memcpy(&rep[off], &h, 2); off+=2;
+        memcpy(&rep[off], &sc, 4); off+=4;
+    }
+    tcp_write(tpcb, rep, off, TCP_WRITE_FLAG_COPY);
+    tcp_output(tpcb);
+    xil_printf("[all] #%d -> %d plates + %d peds, reply %d bytes\r\n",
+               g_all_count, n_plates, n_peds, off);
+}
+
+static err_t all_recv_cb(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err) {
+    (void)arg;
+    if (!p) { tcp_close(tpcb); return ERR_OK; }
+    if (err != ERR_OK) { pbuf_free(p); return err; }
+    tcp_recved(tpcb, p->tot_len);
+    for (struct pbuf *q = p; q; q = q->next) {
+        const uint8_t *bytes = (const uint8_t *)q->payload;
+        uint32_t remain = q->len;
+        while (remain > 0) {
+            if (g_all_state == AL_HDR) {
+                uint32_t need = ALL_HDR_BYTES - g_all_hdr_got;
+                uint32_t take = remain < need ? remain : need;
+                memcpy(&g_all_hdr[g_all_hdr_got], bytes, take);
+                g_all_hdr_got += take; bytes += take; remain -= take;
+                if (g_all_hdr_got == ALL_HDR_BYTES) {
+                    if (!(g_all_hdr[0]=='A' && g_all_hdr[1]=='L' && g_all_hdr[2]=='L' && g_all_hdr[3]==0)) {
+                        xil_printf("[all] bad magic\r\n"); g_all_hdr_got=0; continue;
+                    }
+                    memcpy(&g_all_w, &g_all_hdr[4], 4);
+                    memcpy(&g_all_h, &g_all_hdr[8], 4);
+                    g_all_total = g_all_w * g_all_h;
+                    if (g_all_total > ALL_MAX_W*ALL_MAX_H) {
+                        xil_printf("[all] too big\r\n"); g_all_hdr_got=0; continue;
+                    }
+                    g_all_got = 0;
+                    g_all_state = AL_DATA;
+                }
+            } else {
+                uint32_t need = g_all_total - g_all_got;
+                uint32_t take = remain < need ? remain : need;
+                memcpy(&ALL_SRC_BUF[g_all_got], bytes, take);
+                g_all_got += take; bytes += take; remain -= take;
+                if (g_all_got == g_all_total) {
+                    all_run_and_reply(tpcb);
+                    g_all_hdr_got = 0;
+                    g_all_state = AL_HDR;
+                }
+            }
+        }
+    }
+    pbuf_free(p);
+    return ERR_OK;
+}
+
+static err_t all_accept_cb(void *arg, struct tcp_pcb *newpcb, err_t err) {
+    (void)arg; (void)err;
+    xil_printf("[all] accept from %d.%d.%d.%d\r\n",
+               ip4_addr1(&newpcb->remote_ip), ip4_addr2(&newpcb->remote_ip),
+               ip4_addr3(&newpcb->remote_ip), ip4_addr4(&newpcb->remote_ip));
+    tcp_recv(newpcb, all_recv_cb);
+    g_all_state = AL_HDR; g_all_hdr_got = 0; g_all_got = 0;
+    return ERR_OK;
+}
+
+static void start_all_server(void) {
+    struct tcp_pcb *pcb = tcp_new();
+    tcp_bind(pcb, IP_ADDR_ANY, 5004);
+    pcb = tcp_listen(pcb);
+    tcp_accept(pcb, all_accept_cb);
+    xil_printf("[all] Full-scene on-board pipeline on port 5004\r\n");
+    xil_printf("      protocol: ALL\\0 + w(4) + h(4) + fmt(4) + w*h u8 gray\r\n");
+    xil_printf("      reply:    RES\\0 + n_plates(1) + [x(2)y(2)w(2)h(2) prov(1) al[6]] + n_peds(1) + [x(2)y(2)w(2)h(2) score(4)]\r\n");
+}
+
 /* ========== main ========== */
 static struct netif server_netif;
 static unsigned char mac_ethernet_address[6] = { 0x00, 0x0A, 0x35, 0x00, 0xFC, 0x3A };
@@ -1841,6 +2356,7 @@ int main(void) {
     start_mnist_server();
     start_ped_server();
     start_plt_server();
+    start_all_server();
     print_filter_help();
 
     /* 4. Main loop: drain lwIP queue + poll UART for filter commands */
