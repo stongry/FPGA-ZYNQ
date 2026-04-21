@@ -1680,7 +1680,7 @@ static uint32_t g_plt_count = 0;
 #define PLT_AP_START (1U << 0)
 #define PLT_AP_DONE  (1U << 1)
 
-static volatile int g_plt_use_pl = 0;  /* 0=PS CNN (default), 1=PL CNN HLS */
+static volatile int g_plt_use_pl = 1;  /* PL default per spec; UART 'V' toggles to PS */
 static int g_plt_pl_inited = 0;
 
 /* FC weights live in .rodata (DDR ddr_low region, MMU-mapped cacheable).
@@ -1701,7 +1701,8 @@ static int g_pl_diag_mode = 0;
 /* Run CNN on PL HLS */
 static void plt_cnn_run_pl(const uint8_t image[PCN_PLATE_BYTES],
                             uint8_t *prov, uint8_t al[6]) {
-    xil_printf("[PL] enter (diag=%d)\r\n", g_pl_diag_mode);
+    /* Silenced for ALL\0 batch use; enable via diag mode if needed */
+    if (g_pl_diag_mode != 0) xil_printf("[PL] enter (diag=%d)\r\n", g_pl_diag_mode);
     if (g_pl_diag_mode == 1) {
         *prov = 1; for (int i = 0; i < 6; i++) al[i] = i + 10;
         xil_printf("[PL] diag1 return\r\n");
@@ -1738,19 +1739,15 @@ static void plt_cnn_run_pl(const uint8_t image[PCN_PLATE_BYTES],
         if (c & (1U << 2)) break;  /* idle */
     }
     /* 32-bit word writes to image BRAM (1024 transactions vs 4096 byte) */
-    xil_printf("[PL] step2: write image\r\n");
     volatile uint32_t *dst32 = (volatile uint32_t *)PLT_CNN_IMG_REG;
     const uint32_t *src32 = (const uint32_t *)image;
     for (int i = 0; i < PCN_PLATE_BYTES / 4; i++) dst32[i] = src32[i];
-    xil_printf("[PL] step3: write FC addr\r\n");
     uintptr_t fc_addr = (uintptr_t)plate_cnn_fc_weights;
     PLT_CNN_FC_ADDR_LO = (uint32_t)(fc_addr & 0xFFFFFFFF);
     PLT_CNN_FC_ADDR_HI = (uint32_t)(fc_addr >> 32);
     PLT_CNN_FC_DDR_LO  = (uint32_t)(fc_addr & 0xFFFFFFFF);
     PLT_CNN_FC_DDR_HI  = (uint32_t)(fc_addr >> 32);
-    xil_printf("[PL] step4: start\r\n");
     PLT_CNN_AP_CTRL = PLT_AP_START;
-    xil_printf("[PL] step5: poll\r\n");
     int timed_out = 1;
     for (volatile uint32_t t = 0; t < 600000000U; t++) {
         if (PLT_CNN_AP_CTRL & PLT_AP_DONE) { timed_out = 0; break; }
@@ -1760,10 +1757,8 @@ static void plt_cnn_run_pl(const uint8_t image[PCN_PLATE_BYTES],
         *prov = 0; for (int i = 0; i < 6; i++) al[i] = 0;
         return;
     }
-    xil_printf("[PL] step6: read preds\r\n");
     *prov = PLT_CNN_PRED[0];
     for (int i = 0; i < 6; i++) al[i] = PLT_CNN_PRED[1 + i];
-    xil_printf("[PL] done prov=%d\r\n", *prov);
 }
 
 static void plt_run_and_reply(struct tcp_pcb *tpcb) {
@@ -1869,8 +1864,12 @@ static void start_plt_server(void) {
 /* Large DDR scratch buffers (placed after FB + PED + FLT regions) */
 #define ALL_SRC_ADDR 0x11400000UL   /* 1280x720 = 921KB grayscale */
 #define ALL_EDGE_ADDR 0x11500000UL  /* 1280x720 Sobel out */
+#define ALL_RGB_ADDR  0x11600000UL  /* 1280x720x3 = 2.76MB RGB rx buf */
+#define ALL_HSV_ADDR  0x11900000UL  /* 1280x720 = 921KB blue mask */
 #define ALL_SRC_BUF ((uint8_t *)ALL_SRC_ADDR)
 #define ALL_EDGE_BUF ((uint8_t *)ALL_EDGE_ADDR)
+#define ALL_RGB_BUF ((uint8_t *)ALL_RGB_ADDR)
+#define ALL_HSV_BUF ((uint8_t *)ALL_HSV_ADDR)
 
 typedef struct { int x, y, w, h; } rect_t;
 
@@ -1880,7 +1879,45 @@ static uint8_t g_all_hdr[ALL_HDR_BYTES];
 static uint32_t g_all_hdr_got = 0;
 static uint32_t g_all_got = 0;
 static uint32_t g_all_w = 0, g_all_h = 0, g_all_total = 0;
+static uint32_t g_all_fmt = 0;     /* 0=grayscale w*h bytes, 1=RGB 3*w*h bytes */
 static uint32_t g_all_count = 0;
+
+/* RGB888 → grayscale (BT.601 luma, integer approx). */
+static void rgb_to_gray(const uint8_t *rgb, uint8_t *gray, int W, int H) {
+    int N = W * H;
+    for (int i = 0; i < N; i++) {
+        int r = rgb[3*i + 0], g = rgb[3*i + 1], b = rgb[3*i + 2];
+        /* 0.299*R + 0.587*G + 0.114*B ≈ (77*R + 150*G + 29*B) >> 8 */
+        gray[i] = (uint8_t)((77*r + 150*g + 29*b) >> 8);
+    }
+}
+
+/* RGB → blue-plate HSV mask. Outputs 255 for "blue plate" pixels, else 0.
+ * Chinese blue plates: H≈100-124 (OpenCV scale 0-179), S>=43, V>=46.
+ * We use OpenCV-compatible HSV math (Hue / 2 to fit 0-179 in 8 bits). */
+static void rgb_to_hsv_blue_mask(const uint8_t *rgb, uint8_t *mask, int W, int H) {
+    int N = W * H;
+    for (int i = 0; i < N; i++) {
+        int r = rgb[3*i + 0], g = rgb[3*i + 1], b = rgb[3*i + 2];
+        int mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
+        int mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
+        int v = mx;                         /* V */
+        int delta = mx - mn;
+        int s = (mx == 0) ? 0 : (delta * 255) / mx;  /* S */
+        int h = 0;                          /* H scaled to OpenCV 0..179 */
+        if (delta != 0) {
+            int hh;
+            if (mx == r)      hh = ((g - b) * 60) / delta;          /* 0-60 */
+            else if (mx == g) hh = 120 + ((b - r) * 60) / delta;    /* 60-180 */
+            else              hh = 240 + ((r - g) * 60) / delta;    /* 180-360 (-360..360) */
+            if (hh < 0) hh += 360;
+            h = hh >> 1;                    /* 0..179 */
+        }
+        /* Blue plate ranges (lit and night-tolerant): */
+        int blue = (h >= 100 && h <= 124 && s >= 43 && v >= 46) ? 255 : 0;
+        mask[i] = (uint8_t)blue;
+    }
+}
 
 /* PS-side Sobel edge detection on grayscale image (in-place → ALL_EDGE_BUF).
  * Simple 3x3 Sobel, output |Gx|+|Gy| clamped to 255. */
@@ -2143,24 +2180,61 @@ static void all_run_and_reply(struct tcp_pcb *tpcb) {
         xil_printf("[all] bad dims %dx%d\r\n", W, H);
         return;
     }
-    xil_printf("[all] #%d: %dx%d begin\r\n", ++g_all_count, W, H);
+    xil_printf("[all] #%d: %dx%d fmt=%d begin\r\n",
+               ++g_all_count, W, H, (int)g_all_fmt);
 
-    /* Step 1: Sobel edge detection (PS software) */
+    /* Step 0: If RGB input (fmt=1), produce grayscale + HSV blue mask */
+    if (g_all_fmt == 1) {
+        rgb_to_gray(ALL_RGB_BUF, ALL_SRC_BUF, W, H);
+        rgb_to_hsv_blue_mask(ALL_RGB_BUF, ALL_HSV_BUF, W, H);
+    }
+
+    /* Step 1: Sobel edge detection (PS software) on grayscale */
     sobel_ps(ALL_SRC_BUF, ALL_EDGE_BUF, W, H);
     xil_printf("[all]  sobel done\r\n");
 
-    /* Step 2: Find plate candidate rectangles */
+    /* Step 2: Candidate generation. Sobel-edge candidates always; if RGB,
+     * also HSV-blue-mask candidates. Both feed find_plate_rects (same density
+     * heuristic — any "high response" pixel map works). NMS in find_plate_rects
+     * handles overlap; we deduplicate across the merged set below. */
     rect_t rects[ALL_MAX_PLATES];
     int n_rects = find_plate_rects(ALL_EDGE_BUF, W, H, rects, ALL_MAX_PLATES);
-    xil_printf("[all]  %d plate rects\r\n", n_rects);
+    if (g_all_fmt == 1 && n_rects < ALL_MAX_PLATES) {
+        rect_t hsv_rects[ALL_MAX_PLATES];
+        int avail = ALL_MAX_PLATES - n_rects;
+        int n_hsv = find_plate_rects(ALL_HSV_BUF, W, H, hsv_rects, avail);
+        xil_printf("[all]  sobel=%d  hsv=%d\r\n", n_rects, n_hsv);
+        /* Cross-set NMS: append hsv_rects that don't overlap any sobel rect */
+        for (int i = 0; i < n_hsv && n_rects < ALL_MAX_PLATES; i++) {
+            rect_t a = hsv_rects[i];
+            int dup = 0;
+            for (int j = 0; j < n_rects; j++) {
+                rect_t b = rects[j];
+                int ix1 = a.x > b.x ? a.x : b.x;
+                int iy1 = a.y > b.y ? a.y : b.y;
+                int ix2 = (a.x+a.w) < (b.x+b.w) ? (a.x+a.w) : (b.x+b.w);
+                int iy2 = (a.y+a.h) < (b.y+b.h) ? (a.y+a.h) : (b.y+b.h);
+                int iw = ix2 > ix1 ? ix2 - ix1 : 0;
+                int ih = iy2 > iy1 ? iy2 - iy1 : 0;
+                int inter = iw * ih;
+                int uni = a.w*a.h + b.w*b.h - inter;
+                if (uni > 0 && (inter * 2) > uni) { dup = 1; break; }
+            }
+            if (!dup) rects[n_rects++] = a;
+        }
+    }
+    xil_printf("[all]  total %d rects\r\n", n_rects);
 
-    /* Step 3: Run each variant through PL plate_cnn, emit each as a plate
-     * result. find_plate_rects already NMS-deduplicates candidates so each
-     * variant is on a distinct region; client treats them as candidate set. */
+    /* Step 3: Run each variant through plate_cnn. Cap CNN calls in PL mode:
+     * PL CNN takes ~675ms each, holding the lwIP recv callback that long
+     * starves Ethernet RX IRQ → GEM3 buffer overflow → MAC death. PS CNN
+     * is ~10ms so no cap needed. 6 PL calls = ~4s, lwIP survives. */
     uint8_t plate_results[ALL_MAX_PLATES][7];  /* prov + 6 al */
     rect_t plate_rects[ALL_MAX_PLATES];
     int n_plates = 0;
-    for (int i = 0; i < n_rects && n_plates < ALL_MAX_PLATES; i++) {
+    int cnn_cap = g_plt_use_pl ? 6 : ALL_MAX_PLATES;
+    if (cnn_cap > n_rects) cnn_cap = n_rects;
+    for (int i = 0; i < cnn_cap && n_plates < ALL_MAX_PLATES; i++) {
         uint8_t patch[PCN_PLATE_BYTES];
         crop_resize_128x32(ALL_SRC_BUF, W, H,
                            rects[i].x, rects[i].y, rects[i].w, rects[i].h, patch);
@@ -2240,8 +2314,11 @@ static err_t all_recv_cb(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t 
                     }
                     memcpy(&g_all_w, &g_all_hdr[4], 4);
                     memcpy(&g_all_h, &g_all_hdr[8], 4);
-                    g_all_total = g_all_w * g_all_h;
-                    if (g_all_total > ALL_MAX_W*ALL_MAX_H) {
+                    memcpy(&g_all_fmt, &g_all_hdr[12], 4);
+                    /* fmt=0: grayscale w*h bytes; fmt=1: RGB888 3*w*h bytes */
+                    uint32_t pixels = g_all_w * g_all_h;
+                    g_all_total = (g_all_fmt == 1) ? (3 * pixels) : pixels;
+                    if (pixels > ALL_MAX_W*ALL_MAX_H) {
                         xil_printf("[all] too big\r\n"); g_all_hdr_got=0; continue;
                     }
                     g_all_got = 0;
@@ -2250,7 +2327,9 @@ static err_t all_recv_cb(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t 
             } else {
                 uint32_t need = g_all_total - g_all_got;
                 uint32_t take = remain < need ? remain : need;
-                memcpy(&ALL_SRC_BUF[g_all_got], bytes, take);
+                /* RGB into ALL_RGB_BUF (3*W*H), grayscale into ALL_SRC_BUF */
+                uint8_t *rxbuf = (g_all_fmt == 1) ? ALL_RGB_BUF : ALL_SRC_BUF;
+                memcpy(&rxbuf[g_all_got], bytes, take);
                 g_all_got += take; bytes += take; remain -= take;
                 if (g_all_got == g_all_total) {
                     all_run_and_reply(tpcb);
