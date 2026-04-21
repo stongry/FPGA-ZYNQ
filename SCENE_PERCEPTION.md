@@ -72,7 +72,7 @@ Input:  128×32 灰度 (4096 字节, uint8)
 
 ### 2.3 PL HLS 内核 (plate_cnn_hls)
 
-**文件**: `hls/plate_cnn_hls/plate_cnn_hls_kernel.cpp`
+**文件**: `hls/plate_cnn_hls_kernel.cpp` (snapshot flat) / build server `plate_cnn_hls/plate_cnn_hls_kernel.cpp`
 
 **资源占用 (实测 Vivado 实现)**：
 
@@ -183,7 +183,7 @@ Input: 64×128 灰度
   └─ FC (64→2) → logits (no_ped, ped)
 ```
 
-**参数**: ~50K，INT8 量化 < 100 KB
+**参数**: INT8 权重全部嵌入 HLS 内核（BRAM ~20）
 
 ### 3.2 PL HLS 内核 (pedcnn_hls_ip)
 
@@ -199,9 +199,11 @@ Input: 64×128 灰度
 
 | 偏移 | 名称 | 说明 |
 |------|------|------|
-| 0x00 | AP_CTRL | bit0=start, bit1=done |
-| 0x10 | IMG[8192] | 64×128 输入缓冲 |
-| 0x18 | PRED | 二分类 score (int32) |
+| 0x00 | AP_CTRL | bit0=start, bit1=done, bit2=idle |
+| 0x10 | SCORE_NO | 无行人 logit (int32) |
+| 0x14 | SCORE_YES | 有行人 logit (int32) |
+| 0x18 | PRED | argmax 预测 (uint32) |
+| 0x2000 | IMG[8192] | 64×128 输入 BRAM |
 
 **延迟**: **42 ms / 窗**
 
@@ -219,9 +221,9 @@ step = 24 像素滑窗 (64×128 窗口)
 NMS (IoU > 0.3, 板上实现)
 ```
 
-**窗数**: step=24 + Sobel 密度预筛后约 30 个窗（原始暴力是 136 窗，减少 4.5×）
+**窗数**: 320×240 上 64×128 窗 step=24 → 最多 **55 窗** (11 × 5)。Sobel 密度预筛后实际 CNN 调用约 10-30 次
 
-**总延迟**: 320×240 全图 **~6 秒**（原始 11 秒减半）
+**总延迟**: 320×240 全图 **~6 秒**（原始 11 秒减半，预筛贡献主要加速）
 
 **函数**: `pedcnn_run_patch()`, `pedcnn_sliding()`, `downsample_320x240()`
 
