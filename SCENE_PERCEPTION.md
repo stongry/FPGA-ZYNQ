@@ -200,9 +200,9 @@ PS 读取检测结果并序列化回客户端
 **数据**: Penn-Fudan Pedestrian Dataset (真实街景行人照片)
 
 **分类器**: scikit-learn `LinearSVC`
-- 5-fold CV accuracy: 86.4%
-- INT8 对称量化 SVM 权重 + bias (板上存放)
-- `training/train_inria_svm.py`
+- CV accuracy: **86.4%**（部署在 `ped_hls_weights.h` 里的权重）；后续用 300 正 + 300 负 5-fold CV 复测得 89.3%
+- INT8 对称量化 SVM 权重 + bias
+- 训练脚本: `training/train_inria_svm.py`
 
 **为什么能从 86.4% CV 跑到 95% 真实准确率**：CV 在高度随机划分的正负样本上测，FP 率较高；100 张 Penn-Fudan 完整街景上，Recall=100% (零漏检) + Precision=90.9%，证明 SVM 得分阈值略偏保守。
 
@@ -232,16 +232,19 @@ PS 读取检测结果并序列化回客户端
 | 0x2C | THRESHOLD | SVM 决策阈值 (int32) |
 | 0x80+4i | DET[i] | 检测 i 结果 `(y<<20)|(x<<8)|score_lo`（packed） |
 
-**资源占用**：
+**资源占用** (实测 Vivado 实现)：
 
 | 资源 | 用量 | 占比 |
 |------|------|------|
-| BRAM18 | ~40 | 9% |
-| DSP48E | ~30 | 8% |
-| LUT | ~9,000 | 13% |
-| FF | ~12,000 | 8.5% |
+| BRAM18 | 90 | 31.3% |
+| DSP48E | 4 | 1.1% |
+| LUT | 5,000 | 7.1% |
+| FF | 5,000 | 3.5% |
 
-**延迟**: **22 ms / 帧 (~46 FPS)**
+BRAM 吃得多（HOG cell 直方图 + 权重 + 中间结果），DSP 用得少（SVM 是 3780-MAC 串行展开，复用同一批 DSP 做时分乘加）。
+
+**延迟**: **22 ms / 帧 (~46 FPS)**  
+**功耗**: 126 mW PL 动态功耗，每帧能耗 **2.77 mJ**（对比 PS 估算 ~69 mJ，**省电 41×**）
 
 ### 3.4 固件调用 (TCP 5002)
 
@@ -369,11 +372,11 @@ serialize_reply("RES\0", n_plates, plate_results, n_peds, ped_pos, ped_score);
 
 | IP | BRAM18 | DSP48E | LUT | FF | 说明 |
 |----|--------|--------|-----|-----|------|
-| `ped_hls` (HOG+SVM) | ~40 | ~30 | 9000 | 12000 | Gradient + HOG + 滑窗 + LinearSVM |
+| `ped_hls` (HOG+SVM) | 90 | 4 | 5000 | 5000 | Gradient + HOG + 滑窗 + LinearSVM |
 | AXI Smartconnect | ~5 | 0 | 2000 | 3000 | PS-PL 互联 |
-| **总计** | **~45 / 432 (10%)** | **~30 / 360 (8%)** | **~11K / 71K (15%)** | — | 极省资源，可叠加 plate_cnn |
+| **总计** | **~95 / 432 (22%)** | **~4 / 360 (1.1%)** | **~7K / 71K (10%)** | — | 3780-MAC SVM 串行复用 DSP，省资源但吃 BRAM |
 
-**未来方向**：把 `ped_hls` 和 `plate_cnn_hls` 合进同一 bitstream (预计 ~350 BRAM / ~96 DSP，仍在 XCZU3EG 预算内)，同时获得 HOG+SVM 的验证准确率和 plate_cnn 的车牌识别。当前 v18 用了 `pedcnn_hls_ip` 是因为合成 bitstream 资源测算时更保守，不代表最终选型。
+**关于合并两个 IP**：`plate_cnn_hls` (308 BRAM / 66 DSP) + `ped_hls` (90 BRAM / 4 DSP) + 互联 = **~403 BRAM (93%) / ~70 DSP (19%)**。BRAM 逼近上限但 Vivado 实测可综合；DSP 非常宽裕。当前 v18 选用 `pedcnn_hls_ip` (~20 BRAM) 是为了留出 BRAM 余量方便未来扩展（例如 filter_hls、plate verifier BNN）。
 
 ---
 
