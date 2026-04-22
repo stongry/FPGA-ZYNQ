@@ -1,6 +1,6 @@
 # FZ3A Zynq UltraScale+ FPGA — 实时视频流 + PL 加速 CNN/行人检测/图像滤镜
 
-基于 ALINX FZ3A 开发板（Xilinx XCZU3EG ZynqMP），从零搭建的裸机（bare-metal）嵌入式视觉系统。实现了千兆以太网实时视频流、DisplayPort 显示输出，以及三个 FPGA PL 侧硬件加速器：CNN 手写数字识别、CNN 行人检测 (pedcnn)、实时图像滤镜。
+基于 ALINX FZ3A 开发板（Xilinx XCZU3EG ZynqMP），从零搭建的裸机（bare-metal）嵌入式视觉系统。实现了千兆以太网实时视频流、DisplayPort 显示输出，以及三个 FPGA PL 侧硬件加速器：CNN 手写数字识别、HOG+SVM 行人检测、实时图像滤镜。
 
 ## 系统架构
 
@@ -14,8 +14,8 @@
   28×28 digit image       │  │  CNN TinyLeNet HLS                 │   │
                           │  │  Conv→Pool→Conv→Pool→FC→FC→Argmax  │   │
   PC ────────TCP 5002──▶ │  ├─────────────────────────────────────┤   │
-  320×240 grayscale       │  │  PED CNN HLS (pedcnn_hls_ip)       │   │
-                          │  │  Conv×3 + GAP + FC → binary score  │   │
+  320×240 grayscale       │  │  PED HOG+SVM HLS                   │   │
+                          │  │  Gradient→HOG→SlidingWindow→SVM    │   │
                           │  └─────────────────────────────────────┘   │
                           ├─────────────────────────────────────────────┤
                           │              PS (ARM Cortex-A53)            │
@@ -43,24 +43,23 @@
 |-------|-----|-----|-----|-----|-----|-----|-----|-----|-----|-----|
 | 准确率 | 99.8% | 99.2% | 99.0% | 98.7% | 99.0% | 97.5% | 99.2% | 98.5% | 99.1% | 97.7% |
 
-### CNN 行人检测 (pedcnn) — Penn-Fudan 真实图片测试
-
-**架构**: 64×128 灰度 → Conv×3 + GlobalAvgPool + FC → binary score（有人 / 无人）。PL HLS 内核 `pedcnn_hls_ip`，INT8 权重全部嵌入 BRAM，无需 DDR 访问。
-
-**滑窗管线**: 320×240 输入 → Sobel 密度预筛高响应区 → 64×128 窗口 step=24 → PL CNN 推理 → 板上 NMS (IoU > 0.3)。
+### HOG+SVM 行人检测 — 100 张 Penn-Fudan 真实图片测试
 
 | 指标 | 结果 |
 |------|------|
-| **分类器本身** (单窗) | Penn-Fudan 单行人图正确检出，全黑图 0 误报 |
-| **端到端** (320×240 场景) | NMS 后单行人 1 bbox ✅ |
-| **单窗 PL 延迟** | **42ms** |
-| **全图延迟** (step=24 + Sobel 预筛) | **~6s** (原始暴力 ~11s，预筛贡献加速) |
-| **PL 资源** | ~20 BRAM18, ~20 DSP, ~5000 LUT |
-| 最大窗数 | 55 (11×5, step=24 on 320×240) |
-| 实际 CNN 调用 | ~10-30 次 (经 Sobel 密度预筛) |
-| 数据集 | Penn-Fudan Pedestrian Dataset (真实街景) |
+| **准确率 (Accuracy)** | **95.0%** |
+| **精确率 (Precision)** | **90.9%** |
+| **召回率 (Recall)** | **100.0%** (零漏检) |
+| **F1 Score** | **95.2%** |
+| 推理延迟 | 22ms/帧 (~46 FPS) |
+| 数据集 | Penn-Fudan Pedestrian Dataset (真实街景行人照片) |
 
-**选型理由**: 替换了早期 HOG+SVM 方案（下面"9 种行人检测算法"对比里的 HOG+SVM 行作为历史数据保留），pedcnn 二分类 CNN 直接端到端学习行人特征，无需手工 HOG + SVM 两阶段，且与 plate_cnn_hls 共享同一套 Vitis HLS 工具链。
+```
+混淆矩阵:
+              预测有行人  预测无行人
+实际有行人      TP=50      FN=0
+实际无行人      FP=5       TN=45
+```
 
 ### PS vs PL 协同加速对比 (实测)
 
@@ -69,8 +68,7 @@
 | **Sobel 边缘检测** | 3.2 fps | **18.8 fps** | **5.9x** | 同算法，PL burst-DMA 加速 |
 | **数字识别** | 4.1ms, 96.0% acc | **5.6ms, 98.79% acc** | 精度 +2.8% | PS=2层MLP, PL=6层CNN |
 | | (MLP 784→64→10) | (Conv×2+Pool×2+FC×2) | | PL 跑更复杂模型，精度更高 |
-| **行人检测 (单窗)** | — | **42ms/窗 (PL pedcnn)** | — | PL CNN 二分类器 |
-| **行人检测 (全图)** | 不可行 | **~6s/320×240** (Sobel预筛+滑窗) | — | step=24 + Sobel density 预筛 |
+| **行人检测** | 估算 ~100ms* | **22ms (46 FPS)** | **~4.5x** | PL 完成全部 HOG+SVM 计算 |
 | **视频流 (无滤镜)** | 31.7 fps | 31.7 fps | 1x | 瓶颈在网络带宽，非计算 |
 
 > *PS 行人检测估算：320×240 图像 HOG 计算 (~76K 像素梯度+直方图) + 495 窗口 × 3780 MAC SVM ≈ 1.87M MAC @ 1.2GHz ≈ 100ms+
@@ -841,19 +839,16 @@ python3 clients/full_plate_lpr.py  # 30 张完整中国车牌
 | 量化 | INT8 权重, 嵌入 BRAM |
 | PL 资源 | 12% LUT, 8% BRAM, 22% DSP |
 
-### CNN 行人检测 (端口 5002)
+### HOG+SVM 行人检测 (端口 5002)
 
 | 指标 | 值 |
 |------|------|
-| 算法 | pedcnn_hls_ip — Conv×3 + GlobalAvgPool + FC → 二分类 logits |
-| 输入 | 320×240 灰度图（PS 下采样） |
-| 检测窗口 | 64×128，step=24 → 最多 55 窗 (11×5) |
-| 候选预筛 | PS 软件 Sobel 密度网格，只对高响应区跑 CNN (~10-30 次调用) |
-| 单窗 PL 延迟 | **42ms** |
-| 全图延迟 | **~6s** (含 Sobel + 滑窗 + NMS) |
-| 量化 | INT8 权重，嵌入 PL BRAM (~20 BRAM18) |
-| 计算位置 | **PL (CNN 推理) + PS (Sobel/NMS/滑窗编排)** |
-| 训练数据 | Penn-Fudan Pedestrian Dataset |
+| 算法 | HOG 梯度 + 8×8 cell 直方图 + 滑窗线性 SVM (3780 维) |
+| 输入 | 320×240 灰度图 |
+| 检测窗口 | 64×128 (Dalal-Triggs), 步长 8px, 495 个窗口 |
+| 帧处理时间 | **21.6ms** (~46 FPS) |
+| 训练数据 | Penn-Fudan Pedestrian Dataset, 交叉验证准确率 86.4% |
+| 计算位置 | **纯 PL FPGA**, 图像通过 m_axi DMA 从 DDR 读取 |
 
 ## 硬件平台
 
@@ -895,10 +890,9 @@ python3 clients/full_plate_lpr.py  # 30 张完整中国车牌
 ├── hls/                          # Vitis HLS 加速器源码 (C++ → Verilog)
 │   ├── cnn_hls_kernel.cpp        #   TinyLeNet CNN 推理
 │   ├── cnn_hls_weights.h         #   CNN INT8 量化权重 (98.83% acc)
-│   ├── ped_hls_kernel.cpp        #   [历史] HOG+SVM 行人检测 (v17 及之前)
-│   ├── ped_hls_weights.h         #   [历史] SVM INT8 权重 (Penn-Fudan, 86.4% CV)
-│   ├── ped_svm_info.json         #   [历史] SVM 训练元数据
-│   └── pedcnn_hls/               #   [当前 v18] CNN 行人检测 (Conv×3+GAP+FC, BRAM-resident)
+│   ├── ped_hls_kernel.cpp        #   HOG+SVM 行人检测
+│   ├── ped_hls_weights.h         #   SVM INT8 权重 (Penn-Fudan, 86.4% CV)
+│   ├── ped_svm_info.json         #   SVM 训练元数据
 │   ├── filter_hls_kernel.cpp     #   视频滤镜 (burst-optimized)
 │   ├── mnist_data.h              #   INT8 单层权重 (legacy HLS matmul)
 │   └── cnn_scales.txt            #   量化 scale 参数
@@ -994,40 +988,33 @@ python3 train_mnist.py          # PyTorch TinyLeNet, 98.83% test acc
 python3 quantize.py             # FP32 → INT8, 生成 C 头文件
 ```
 
-### 3. CNN 行人检测 (pedcnn_hls_ip, Vitis HLS)
+### 3. HOG+SVM 行人检测 (Vitis HLS)
 
 ```
-全图 (可变分辨率, PS DDR)
-    │  PS 下采样到 320×240
+320×240 灰度图 (DDR)
+    │  m_axi DMA burst read
     ▼
-  Sobel 密度网格 (PS 软件, 预筛高响应区)
-    │
-    │  对每个候选 64×128 窗口：
+  Gradient (centered difference, L1 magnitude)
     ▼
-  PL pedcnn_hls_ip (BRAM 输入缓冲 0x2000):
-    Conv1 (1→16)  + ReLU + MaxPool 2x2 → (16, 32, 64)
-    Conv2 (16→32) + ReLU + MaxPool 2x2 → (32, 16, 32)
-    Conv3 (32→64) + ReLU + MaxPool 2x2 → (64, 8, 16)
-    GlobalAvgPool                       → (64,)
-    FC (64→2)                           → {score_no, score_yes}
+  Cell Histogram (8×8 cell, 9 orientation bins)
     ▼
-  PS NMS (IoU > 0.3) + 结果序列化
+  Sliding Window (64×128, stride 8px, 495 windows)
     ▼
-  Detections (x, y, w=64, h=128, score) × 16 max
+  Linear SVM (3780-dim dot product per window)
+    ▼
+  Detections (x, y, score) × 16 max
 ```
 
 **HLS 实现:**
-- INT8 权重全部嵌入 BRAM（约 20 个 BRAM18），无需 DDR 访问
-- `s_axilite` MMIO 写 IMG[8192] 输入缓冲（0x2000 偏移），读 SCORE_NO/SCORE_YES/PRED
-- 单窗 42ms，Sobel 预筛+滑窗全图 ~6s
+- `m_axi` 接口从 DDR 读取图像 (76800 字节 burst), `s_axilite` 用于控制和结果
+- PS 把图像放 DDR → 传地址给 HLS → HLS 自己做 DMA 读取
+- SmartConnect 桥接 m_axi 到 PS S_AXI_HP0_FPD 高性能端口
 
 **训练流程:**
 ```bash
 # Penn-Fudan Pedestrian Dataset
-python3 train_pedcnn.py         # PyTorch 3-Conv 二分类, INT8 量化导出
+python3 train_inria_svm.py      # scikit-learn LinearSVC, 86.4% CV acc
 ```
-
-早期 HOG+SVM HLS 方案（"9 种行人检测算法"章节下保留的对比数据）展示了手工特征 + 线性分类器的基线；当前 v18 bitstream 已替换为 pedcnn CNN，与 plate_cnn_hls 共享工具链并获得更强的特征表达能力。
 
 ### 4. HLS 图像滤镜 (Burst-Optimized)
 
@@ -1171,7 +1158,7 @@ board  → client: "DET\0" + n_dets(4) + n × {pos_word(4) + score_word(4)}
 | IP | LUT | FF | BRAM18 | DSP48 |
 |----|-----|----|--------|-------|
 | CNN TinyLeNet | ~9000 | ~7400 | 35 | 81 |
-| PED CNN (pedcnn_hls_ip) | ~5000 | ~6000 | ~20 | ~20 |
+| PED HOG+SVM | ~5000 | ~5000 | ~90 | 4 |
 | Filter (burst) | ~3000 | ~3000 | ~5 | 4 |
 | AXI 基础设施 | ~3000 | ~4000 | ~5 | 0 |
 | **总计** | **~20000** | **~19400** | **~135** | **89** |
@@ -1197,7 +1184,7 @@ board  → client: "DET\0" + n_dets(4) + n × {pos_word(4) + score_word(4)}
 | 模块 | 功耗 (W) | 占总功耗 | 说明 |
 |------|----------|----------|------|
 | **PS (ARM Cortex-A53)** | **2.300** | **77.4%** | 含 DDR4 控制器、GigE MAC、DP |
-| PED 行人检测 HLS | 0.126 | 4.2% | pedcnn CNN (Conv×3 + GAP + FC), BRAM-resident weights |
+| PED 行人检测 HLS | 0.126 | 4.2% | HOG+SVM, m_axi DMA |
 | Filter 滤镜 HLS | 0.084 | 2.8% | Sobel/Laplacian 3×3, burst |
 | CNN TinyLeNet HLS | 0.080 | 2.7% | Conv+Pool+FC, AXI-Lite |
 | SmartConnect (DMA 桥) | 0.053 | 1.8% | HP0 端口连接 |
@@ -1282,9 +1269,7 @@ board  → client: "DET\0" + n_dets(4) + n × {pos_word(4) + score_word(4)}
 | 占用 | 22.5% DSP | 1.1% DSP | 100% CPU | 1 GPU | 1核 | 1核 |
 | 可并行其他任务 | ✅ PS空闲 | ✅ PS空闲 | ❌ CPU满载 | ✅ CPU空闲 | ✅ | ✅ |
 
-### 行人检测 (历史 HOG+SVM 基线对比, 320×240)
-
-> 注：下表是早期 HOG+SVM 方案在 FPGA vs GPU/CPU 上的速度能耗对比，作为算法基线参考保留。**当前 v18 bitstream 使用 CNN pedcnn_hls_ip，见"CNN 行人检测"节。**
+### 行人检测 (HOG+SVM, 320×240)
 
 | | **FPGA PL HLS** | **FPGA PS (估算)** | **GPU服务器 CPU** | **RTX 5090 GPU** | **R9 9950X3D** |
 |--|:-:|:-:|:-:|:-:|:-:|
